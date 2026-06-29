@@ -22,8 +22,8 @@ routes, no read-back/query API, no admin endpoints.
 - `cargo deny check` — supply-chain / license audit
 
 ## Architecture
-- `src/lib.rs` — `build_app(config)` assembles the core router + middleware (unit-testable).
-- `src/main.rs` — config load, rate-limit + concurrency layers, retention sweep, hand-off to `server::serve`.
+- `src/lib.rs` — `build_app(config)` assembles the core router + middleware (unit-testable); `apply_rate_limit(base, config)` attaches the governor layer with the black-hole error handler.
+- `src/main.rs` — config load, concurrency layer + `apply_rate_limit`, retention sweep, hand-off to `server::serve`.
 - `src/server.rs` — hyper accept loop with an HTTP/1 header-read timeout (slowloris bound), `ConnectInfo` injection, graceful shutdown.
 - `src/config.rs` — env-driven `Config` with validation (token strength, tolerant bool parsing, etc.).
 - `src/auth.rs` — constant-time Bearer/query-token middleware (`route_layer`, pre-body).
@@ -34,7 +34,7 @@ routes, no read-back/query API, no admin endpoints.
 - `src/error.rs` — non-leaky `AppError` -> HTTP responses.
 - `src/observability.rs` — throttled rejection counter + time/date helpers.
 - `tests/integration.rs` — auth, validation, storage, headers, method-probe black hole, retention.
-- `tests/server.rs` — live serve loop over TCP: happy path, method-probe, slowloris timeout.
+- `tests/server.rs` — live serve loop over TCP: happy path, method-probe, slowloris timeout, rate-limit flood black-holed as 404 (not 429).
 
 ## Security invariants (do not regress)
 - Exactly one ingest route; no path/route parameters anywhere (designs out IDOR / traversal).
@@ -43,6 +43,7 @@ routes, no read-back/query API, no admin endpoints.
 - Storage filename is derived server-side from UTC date — never from client input; retention only ever deletes strict `YYYY-MM-DD.ndjson` files.
 - Error bodies are generic; the token is never logged or echoed (including the query-string form).
 - Rejections are rate-limited in the logs (aggregated, not per-event at info).
+- The rate limiter's rejection must stay a bare `404` (via `apply_rate_limit`'s `error_handler`) — **never let tower_governor emit its default `429 + Retry-After`**, which fingerprints the limiter and leaks its timing, breaking the black-hole property.
 - The HTTP/1 header-read timeout (slowloris bound) must stay set; it requires a hyper `Timer` (`TokioTimer`) to arm.
 - Any new dependency must pass `cargo deny check` and keep the tree minimal.
 - Keep files < 300 lines and functions < 50 lines.

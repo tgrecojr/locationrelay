@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use locationrelay::config::Config;
-use locationrelay::{build_app, server};
+use locationrelay::{apply_rate_limit, build_app, server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -101,6 +101,61 @@ async fn method_probe_over_tcp_has_no_allow_header() {
         !resp.to_ascii_lowercase().contains("allow:"),
         "GET / leaked an Allow header over the wire:\n{resp}"
     );
+
+    handle.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn rate_limited_flood_is_black_holed_not_429() {
+    // Tiny bucket so a quick burst from one peer IP trips the limiter.
+    let mut cfg = (*test_config(&std::env::temp_dir().join("locationrelay-srv-ratelimit"))).clone();
+    cfg.rate_per_second = 1;
+    cfg.rate_burst = 1;
+    let config = Arc::new(cfg);
+    let dir = config.data_dir.clone();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    // Build the full stack exactly as `main` does: app + rate limit.
+    locationrelay::storage::ensure_data_dir(&config)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = apply_rate_limit(build_app(config.clone()), &config);
+    let timeout = Duration::from_secs(config.header_read_timeout_secs);
+    let handle = tokio::spawn(async move {
+        let _ = server::serve(listener, app, timeout).await;
+    });
+
+    // Fire a rapid burst on separate connections; later ones must be throttled.
+    let mut responses = Vec::new();
+    for _ in 0..6 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        responses.push(read_to_string(stream).await);
+    }
+
+    for resp in &responses {
+        let lower = resp.to_ascii_lowercase();
+        // The throttle rejection must be indistinguishable from any other miss:
+        // a bare 404, never the tower_governor 429 / wait-time disclosure.
+        assert!(
+            resp.starts_with("HTTP/1.1 404"),
+            "rate-limited request leaked a non-404 status:\n{resp}"
+        );
+        assert!(
+            !lower.contains("429") && !lower.contains("too many requests"),
+            "throttle response fingerprinted the limiter (429/'too many'):\n{resp}"
+        );
+        assert!(
+            !lower.contains("retry-after") && !lower.contains("x-ratelimit"),
+            "throttle response leaked rate-limit timing headers:\n{resp}"
+        );
+    }
 
     handle.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
