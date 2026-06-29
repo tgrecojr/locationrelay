@@ -1,0 +1,27 @@
+# Environment
+.env
+.env.*
+.env.local
+!.env.example
+
+.python-version
+
+# Rust build output
+/target/
+
+# Captured location data — never commit beacons
+/data/
+*.ndjson
+
+# Claude local files
+.claude/settings.local.json
+CLAUDE.local.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

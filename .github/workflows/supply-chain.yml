@@ -1,0 +1,44 @@
+name: Supply chain scan
+
+# Reusable workflow: dependency / advisory scanning that is independent of the
+# Rust build. cargo-deny (advisories + licenses + bans + sources) runs in the
+# main CI workflow; this adds Socket Security and OSV on top.
+on:
+  workflow_call:
+    secrets:
+      SOCKET_SECURITY_API_KEY:
+        # Not required: a fork PR has no access to the secret, so the Socket
+        # step self-skips (guarded below) instead of hard-failing the run. OSV
+        # still runs on every PR.
+        required: false
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Socket Security scan
+        # Skip when the secret is unavailable (e.g. a pull request from a fork).
+        if: ${{ env.SOCKET_SECURITY_API_KEY != '' }}
+        run: |
+          repo_slug="${GITHUB_REPOSITORY##*/}"
+          branch_name="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          npx -y @socketsecurity/cli@1.1.102 scan create \
+            --org grecolabs \
+            --repo "${repo_slug}" \
+            --branch "${branch_name}" \
+            --report \
+            ./
+
+      - name: OSV scan (cargo lockfile)
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        with:
+          scan-args: |-
+            --recursive
+            ./

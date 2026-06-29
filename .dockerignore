@@ -1,0 +1,27 @@
+# Mirror .gitignore — keep the build context minimal and secret-free.
+.git/
+.github/
+target/
+data/
+*.ndjson
+
+.env
+.env.*
+!.env.example
+
+docs/
+scripts/
+tests/
+
+# Repo tooling configs not needed in the build context.
+renovate.json
+osv-scanner.toml
+deny.toml
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+README.md
+CLAUDE.md

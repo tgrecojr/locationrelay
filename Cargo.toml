@@ -1,0 +1,45 @@
+[package]
+name = "locationrelay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Hardened, single-purpose receiver for Overland iOS location beacons"
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# hyper/hyper-util are used directly for the serve loop so we can set an HTTP/1
+# header-read timeout (slowloris bound) that axum::serve does not expose.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-graceful", "tokio"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "signal", "time"] }
+tower = { version = "0.5", default-features = false, features = ["limit", "util"] }
+tower-http = { version = "0.7", default-features = false, features = ["timeout", "catch-panic", "trace"] }
+# axum feature provides the GovernorError -> axum Response conversion; we skip
+# the default `tonic` feature since this service is HTTP-only.
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Correct x-www-form-urlencoded decoding of the optional `?token=` query form
+# (handles `+` and `%XX`, so a base64 token survives the round-trip).
+form_urlencoded = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+subtle = "2"
+time = { version = "0.3", features = ["formatting"] }
+anyhow = "1"
+dotenvy = "0.15"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+# Keep panic = "unwind" so tower-http CatchPanicLayer can turn a panicked
+# request into a 500 instead of aborting the worker thread.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true
