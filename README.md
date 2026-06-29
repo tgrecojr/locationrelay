@@ -27,7 +27,10 @@ even confirm that an ingest endpoint exists here.
 
 Layers run outermost-first, so cheap rejections happen before expensive work:
 
-1. **Rate limit** (per-client, `429`) — a flood is dropped before anything else.
+1. **Rate limit** (per-client) — a flood is dropped before anything else. The
+   rejection is a bare `404`, identical to every other miss: the limiter never
+   emits a `429` / `Retry-After`, so a flood probe can't fingerprint it or learn
+   its timing.
 2. **Body-size limit** (`413`) — oversized payloads never reach the parser.
 3. **Auth** — constant-time Bearer/query-token check, **before the body is read**.
    Failure returns a black-hole `404` (indistinguishable from an unknown route).

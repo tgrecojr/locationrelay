@@ -4,14 +4,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use locationrelay::config::Config;
-use locationrelay::{build_app, observability, server, storage};
+use locationrelay::{apply_rate_limit, build_app, observability, server, storage};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_governor::GovernorLayer;
-use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::{PeerIpKeyExtractor, SmartIpKeyExtractor};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_retention(config.clone());
 
     // Per-client rate limiting (keyed per `apply_rate_limit`). A flood is
-    // rejected with 429 at the outermost layer, before auth even runs.
+    // black-holed as a bare 404 at the outermost layer, before auth even runs.
     let base = build_app(config.clone()).layer(ConcurrencyLimitLayer::new(config.max_concurrency));
     let app = apply_rate_limit(base, &config);
 
@@ -59,57 +55,6 @@ fn spawn_retention(config: Arc<Config>) {
             }
         }
     });
-}
-
-/// Attach per-client rate limiting to the router.
-///
-/// Default (`trust_proxy = false`): key on the **TCP peer IP**
-/// (`PeerIpKeyExtractor`). Headers cannot influence the key, so an attacker
-/// can neither evade the limit nor inflate the limiter's keyed map by rotating
-/// `X-Forwarded-For`. Behind a reverse proxy the peer is the proxy, so all
-/// traffic shares one bucket — correct for a single-device sink.
-///
-/// `trust_proxy = true`: key on the proxy-set forwarded header
-/// (`SmartIpKeyExtractor`) for genuine per-client limiting. Only safe when the
-/// proxy overwrites/strips any client-supplied forwarded headers.
-///
-/// Both extractors key on `IpAddr`, so the limiter type is identical and
-/// `Router::layer` erases both branches back to a plain `Router`.
-fn apply_rate_limit(base: Router, config: &Config) -> Router {
-    // The cleanup thread is inlined in each branch so the limiter's concrete
-    // type is inferred — the two key extractors produce different generic types
-    // that are awkward to name explicitly.
-    if config.trust_proxy {
-        let conf = GovernorConfigBuilder::default()
-            .per_second(config.rate_per_second)
-            .burst_size(config.rate_burst)
-            .key_extractor(SmartIpKeyExtractor)
-            .finish()
-            .expect("valid rate-limit configuration");
-        let limiter = conf.limiter().clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(60));
-                limiter.retain_recent();
-            }
-        });
-        base.layer(GovernorLayer::new(conf))
-    } else {
-        let conf = GovernorConfigBuilder::default()
-            .per_second(config.rate_per_second)
-            .burst_size(config.rate_burst)
-            .key_extractor(PeerIpKeyExtractor)
-            .finish()
-            .expect("valid rate-limit configuration");
-        let limiter = conf.limiter().clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(60));
-                limiter.retain_recent();
-            }
-        });
-        base.layer(GovernorLayer::new(conf))
-    }
 }
 
 fn init_tracing() {
