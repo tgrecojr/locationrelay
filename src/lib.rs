@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod forwarder;
 pub mod handlers;
 pub mod models;
 pub mod observability;
@@ -15,7 +16,7 @@ pub mod storage;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, FromRef};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::any;
@@ -28,13 +29,34 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::forwarder::ForwardHandle;
+
+/// Router state: the shared config plus the (possibly disabled) forward queue
+/// handle. Both are extractable in handlers via [`FromRef`].
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub forwarder: ForwardHandle,
+}
+
+impl FromRef<AppState> for Arc<Config> {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
+
+impl FromRef<AppState> for ForwardHandle {
+    fn from_ref(state: &AppState) -> Self {
+        state.forwarder.clone()
+    }
+}
 
 /// Build the core application router: a single authenticated ingest route plus
 /// a catch-all 404, wrapped with auth, body-size limit, request timeout,
 /// security headers, panic isolation, and tracing. There is no health/status
 /// endpoint. Rate limiting and the concurrency cap are applied in `main` (they
 /// need per-connection IP info) so this stays unit-testable.
-pub fn build_app(config: Arc<Config>) -> Router {
+pub fn build_app(config: Arc<Config>, forwarder: ForwardHandle) -> Router {
     let timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let body_limit = config.max_body_bytes;
 
@@ -73,7 +95,7 @@ pub fn build_app(config: Arc<Config>) -> Router {
                 )
             },
         ))
-        .with_state(config)
+        .with_state(AppState { config, forwarder })
 }
 
 /// Map every rate-limit rejection to a bare 404 — byte-identical to the

@@ -5,6 +5,12 @@
 FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /build
 
+# aws-lc-sys (reqwest's rustls crypto provider, used for HTTPS to Dawarich)
+# compiles AWS-LC from C source, which needs cmake + a C toolchain.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Cache dependencies separately from source for faster rebuilds.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \

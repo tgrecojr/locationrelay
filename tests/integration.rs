@@ -26,7 +26,17 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         retention_days: 14,
         fsync: false,
         trust_proxy: false,
+        dawarich: None,
+        forward_timeout_secs: 5,
+        forward_queue_capacity: 256,
+        forward_max_attempts: 3,
     })
+}
+
+/// All router-level tests run with forwarding disabled, so the core ingest
+/// behavior is exercised independently of any Dawarich relay.
+fn app(config: Arc<Config>) -> axum::Router {
+    build_app(config, locationrelay::forwarder::ForwardHandle::disabled())
 }
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
@@ -57,7 +67,7 @@ fn post(token: Option<&str>, body: &str) -> Request<Body> {
 }
 
 async fn status_of(config: Arc<Config>, req: Request<Body>) -> StatusCode {
-    build_app(config).oneshot(req).await.unwrap().status()
+    app(config).oneshot(req).await.unwrap().status()
 }
 
 #[tokio::test]
@@ -66,7 +76,7 @@ async fn valid_request_is_stored() {
     let config = test_config(&dir);
     storage::ensure_data_dir(&config).await.unwrap();
 
-    let response = build_app(config)
+    let response = app(config)
         .oneshot(post(Some(TOKEN), &valid_body()))
         .await
         .unwrap();
@@ -97,7 +107,7 @@ async fn concurrent_writes_do_not_interleave() {
     let dir = unique_dir("concurrent");
     let config = test_config(&dir);
     storage::ensure_data_dir(&config).await.unwrap();
-    let app = build_app(config);
+    let app = app(config);
 
     let mut handles = Vec::new();
     for _ in 0..N {
@@ -157,11 +167,11 @@ async fn wrong_token_is_black_holed() {
 async fn auth_failure_is_indistinguishable_from_unknown_route() {
     let dir = unique_dir("blackhole");
 
-    let bad_token = build_app(test_config(&dir))
+    let bad_token = app(test_config(&dir))
         .oneshot(post(Some("nope-nope-nope-nope"), &valid_body()))
         .await
         .unwrap();
-    let unknown = build_app(test_config(&dir))
+    let unknown = app(test_config(&dir))
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -189,7 +199,7 @@ async fn auth_failure_is_indistinguishable_from_unknown_route() {
 #[tokio::test]
 async fn method_probe_on_root_is_indistinguishable_from_unknown_route() {
     for method in ["GET", "OPTIONS", "HEAD", "PUT", "DELETE"] {
-        let on_root = build_app(test_config(&unique_dir("methodprobe")))
+        let on_root = app(test_config(&unique_dir("methodprobe")))
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -199,7 +209,7 @@ async fn method_probe_on_root_is_indistinguishable_from_unknown_route() {
             )
             .await
             .unwrap();
-        let on_unknown = build_app(test_config(&unique_dir("methodprobe")))
+        let on_unknown = app(test_config(&unique_dir("methodprobe")))
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -233,7 +243,7 @@ async fn valid_token_non_post_is_black_holed() {
         .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
         .body(Body::empty())
         .unwrap();
-    let response = build_app(config).oneshot(req).await.unwrap();
+    let response = app(config).oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(response.headers().get(header::ALLOW).is_none());
 }
@@ -288,7 +298,7 @@ async fn query_token_auth_decodes_special_chars() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(valid_body()))
         .unwrap();
-    let response = build_app(config).oneshot(req).await.unwrap();
+    let response = app(config).oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -349,7 +359,7 @@ async fn security_headers_present() {
         .uri("/anything")
         .body(Body::empty())
         .unwrap();
-    let response = build_app(config).oneshot(req).await.unwrap();
+    let response = app(config).oneshot(req).await.unwrap();
     assert_eq!(
         response.headers().get("x-content-type-options").unwrap(),
         "nosniff"

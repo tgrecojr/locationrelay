@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use locationrelay::config::Config;
+use locationrelay::forwarder::ForwardHandle;
 use locationrelay::{apply_rate_limit, build_app, server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,7 +27,16 @@ fn test_config(dir: &std::path::Path) -> Arc<Config> {
         retention_days: 14,
         fsync: false,
         trust_proxy: false,
+        dawarich: None,
+        forward_timeout_secs: 5,
+        forward_queue_capacity: 256,
+        forward_max_attempts: 3,
     })
+}
+
+/// Serve-loop tests run with forwarding disabled.
+fn app(config: Arc<Config>) -> axum::Router {
+    build_app(config, ForwardHandle::disabled())
 }
 
 /// Bind an ephemeral port, spawn the real serve loop, return the bound addr and
@@ -37,7 +47,7 @@ async fn spawn_server(config: Arc<Config>) -> (std::net::SocketAddr, tokio::task
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_app(config.clone());
+    let app = app(config.clone());
     let timeout = Duration::from_secs(config.header_read_timeout_secs);
     let handle = tokio::spawn(async move {
         let _ = server::serve(listener, app, timeout).await;
@@ -122,7 +132,7 @@ async fn rate_limited_flood_is_black_holed_not_429() {
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = apply_rate_limit(build_app(config.clone()), &config);
+    let app = apply_rate_limit(app(config.clone()), &config);
     let timeout = Duration::from_secs(config.header_read_timeout_secs);
     let handle = tokio::spawn(async move {
         let _ = server::serve(listener, app, timeout).await;

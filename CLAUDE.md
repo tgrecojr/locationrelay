@@ -3,14 +3,20 @@
 ## Overview
 A single-purpose, security-hardened HTTP receiver for Overland iOS location
 beacons. It authenticates a `POST`, validates the GeoJSON batch, and appends it
-to disk as NDJSON. It intentionally does nothing else — no DB, no dynamic
-routes, no read-back/query API, no admin endpoints.
+to disk as NDJSON. It intentionally does nothing else on the inbound surface —
+no DB, no dynamic routes, no read-back/query API, no admin endpoints.
+
+Optionally it also **relays** each batch onward to a Dawarich instance (Overland
+endpoint) via a decoupled background worker. Forwarding is off unless
+`LOCATIONRELAY_DAWARICH_URL` + `LOCATIONRELAY_DAWARICH_TOKEN` are both set; when
+off the service is byte-for-byte the original pure disk sink.
 
 ## Tech Stack
 - Language: Rust (edition 2024, pinned to 1.94 via `rust-toolchain.toml`)
 - HTTP: axum 0.8 (hyper / tokio)
 - Middleware: tower / tower-http (timeout, catch-panic, trace), tower_governor (rate limit)
 - Crypto: subtle (constant-time token comparison)
+- Outbound HTTP (Dawarich relay): reqwest (rustls/aws-lc-rs TLS, no default features)
 - Storage: append-only NDJSON on the local filesystem
 
 ## Commands
@@ -22,19 +28,21 @@ routes, no read-back/query API, no admin endpoints.
 - `cargo deny check` — supply-chain / license audit
 
 ## Architecture
-- `src/lib.rs` — `build_app(config)` assembles the core router + middleware (unit-testable); `apply_rate_limit(base, config)` attaches the governor layer with the black-hole error handler.
-- `src/main.rs` — config load, concurrency layer + `apply_rate_limit`, retention sweep, hand-off to `server::serve`.
+- `src/lib.rs` — `build_app(config, forwarder)` assembles the core router + middleware (unit-testable) and the `AppState { config, forwarder }` (FromRef-extractable); `apply_rate_limit(base, config)` attaches the governor layer with the black-hole error handler.
+- `src/main.rs` — config load, `forwarder::start`, concurrency layer + `apply_rate_limit`, retention sweep, rejection + forward-failure reporters, hand-off to `server::serve`.
+- `src/forwarder.rs` — optional outbound relay to Dawarich. `ForwardHandle` (cloneable, `disabled()` when off) feeds a bounded in-memory queue; a single background worker POSTs to `{url}/api/v1/overland/batches` with a Bearer header, retry/backoff, no redirects. Decoupled so the inbound handler never blocks.
 - `src/server.rs` — hyper accept loop with an HTTP/1 header-read timeout (slowloris bound), `ConnectInfo` injection, graceful shutdown.
 - `src/config.rs` — env-driven `Config` with validation (token strength, tolerant bool parsing, etc.).
 - `src/auth.rs` — constant-time Bearer/query-token middleware (`route_layer`, pre-body).
 - `src/models.rs` — Overland payload shape + strict GeoJSON validation.
 - `src/storage.rs` — server-side date filename, append-only `0600` NDJSON writes, global write lock (no interleaving), retention pruning.
-- `src/handlers.rs` — `receive` (POST-only; non-POST black-holed) / `not_found` (no health/status endpoint).
+- `src/handlers.rs` — `receive` (POST-only; non-POST black-holed) persists then enqueues to the forwarder (after the durable write, never blocking) / `not_found` (no health/status endpoint).
 - `src/security.rs` — response security headers.
 - `src/error.rs` — non-leaky `AppError` -> HTTP responses.
-- `src/observability.rs` — throttled rejection counter + time/date helpers.
-- `tests/integration.rs` — auth, validation, storage, headers, method-probe black hole, retention.
+- `src/observability.rs` — throttled rejection + forward-failure counters/reporters + time/date helpers.
+- `tests/integration.rs` — auth, validation, storage, headers, method-probe black hole, retention (router built with forwarding disabled).
 - `tests/server.rs` — live serve loop over TCP: happy path, method-probe, slowloris timeout, rate-limit flood black-holed as 404 (not 429).
+- `tests/forwarder.rs` — mock Dawarich: Bearer header (no query/body api_key), correct path/method/body, transient retry, no-retry on 4xx, slow-Dawarich decoupling. Plus `config.rs` unit tests for `build_dawarich` validation.
 
 ## Security invariants (do not regress)
 - Exactly one ingest route; no path/route parameters anywhere (designs out IDOR / traversal).
@@ -45,7 +53,8 @@ routes, no read-back/query API, no admin endpoints.
 - Rejections are rate-limited in the logs (aggregated, not per-event at info).
 - The rate limiter's rejection must stay a bare `404` (via `apply_rate_limit`'s `error_handler`) — **never let tower_governor emit its default `429 + Retry-After`**, which fingerprints the limiter and leaks its timing, breaking the black-hole property.
 - The HTTP/1 header-read timeout (slowloris bound) must stay set; it requires a hyper `Timer` (`TokioTimer`) to arm.
-- Any new dependency must pass `cargo deny check` and keep the tree minimal.
+- Dawarich relay invariants: the Dawarich key is sent **Bearer-only** (never a query parameter or body field) and is never logged; `LOCATIONRELAY_DAWARICH_TOKEN` must differ from `LOCATIONRELAY_TOKEN` (enforced at startup); forwarding is **decoupled** and must never block or fail the inbound handler (enqueue is non-blocking `try_send` after the durable write); the outbound client follows **no redirects**; forwarding stays **outbound-only** — never add an inbound route or surface for it.
+- Any new dependency must pass `cargo deny check` and keep the tree minimal. (reqwest's rustls/aws-lc-rs needs `cmake` + a C toolchain in the Docker builder stage, and the `CDLA-Permissive-2.0` license allowance in `deny.toml` for the Mozilla root bundle.)
 - Keep files < 300 lines and functions < 50 lines.
 
 ## Environment Variables
@@ -55,6 +64,10 @@ Optional: `LOCATIONRELAY_BIND`, `LOCATIONRELAY_DATA_DIR`, `LOCATIONRELAY_MAX_BOD
 `LOCATIONRELAY_MAX_CONCURRENCY`, `LOCATIONRELAY_RATE_PER_SECOND`, `LOCATIONRELAY_RATE_BURST`,
 `LOCATIONRELAY_RETENTION_DAYS`, `LOCATIONRELAY_TRUST_PROXY`, `LOCATIONRELAY_FSYNC`,
 `LOCATIONRELAY_LOG`.
+Optional Dawarich relay (forwarding off unless the first two are both set):
+`LOCATIONRELAY_DAWARICH_URL`, `LOCATIONRELAY_DAWARICH_TOKEN`,
+`LOCATIONRELAY_FORWARD_TIMEOUT_SECS`, `LOCATIONRELAY_FORWARD_QUEUE_CAPACITY`,
+`LOCATIONRELAY_FORWARD_MAX_ATTEMPTS`.
 
 ## CI/CD (.github/workflows)
 - `ci.yml` — build/lint/test, `cargo-deny` audit, the `supply-chain` scan, then

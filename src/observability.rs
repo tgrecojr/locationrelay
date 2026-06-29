@@ -12,22 +12,44 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 static REJECTED: AtomicU64 = AtomicU64::new(0);
+static FORWARD_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Record a single rejected request (bad token, bad payload, etc.).
 pub fn record_rejection() {
     REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a single batch that could not be forwarded to Dawarich (queue
+/// overflow, exhausted retries, or a hard rejection). Aggregated like
+/// rejections so a Dawarich outage can't flood the logs.
+pub fn record_forward_failure() {
+    FORWARD_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Spawn a task that emits one throttled summary line per minute, only when
 /// there is something to report.
 pub fn spawn_rejection_reporter() {
+    spawn_counter_reporter(&REJECTED, "rejected requests in the last 60s");
+}
+
+/// Spawn the equivalent throttled reporter for failed Dawarich forwards.
+pub fn spawn_forward_failure_reporter() {
+    spawn_counter_reporter(
+        &FORWARD_FAILED,
+        "batches not forwarded to Dawarich in the last 60s (still on disk)",
+    );
+}
+
+/// Emit at most one aggregated `warn` line per minute for a counter, resetting
+/// it each tick, and only when there is something to report.
+fn spawn_counter_reporter(counter: &'static AtomicU64, message: &'static str) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let count = REJECTED.swap(0, Ordering::Relaxed);
+            let count = counter.swap(0, Ordering::Relaxed);
             if count > 0 {
-                tracing::warn!(rejected = count, "rejected requests in the last 60s");
+                tracing::warn!(count, "{}", message);
             }
         }
     });
