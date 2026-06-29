@@ -9,7 +9,7 @@ yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
-wildcard-dependencies = "deny"
+wildcards = "deny"
 
 [licenses]
 # Allow common permissive licenses used across the Rust ecosystem.
