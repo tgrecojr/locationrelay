@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use locationrelay::config::Config;
-use locationrelay::{apply_rate_limit, build_app, observability, server, storage};
+use locationrelay::{apply_rate_limit, build_app, forwarder, observability, server, storage};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 
@@ -17,11 +17,17 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env()?);
     storage::ensure_data_dir(&config).await?;
     observability::spawn_rejection_reporter();
+    observability::spawn_forward_failure_reporter();
     spawn_retention(config.clone());
+
+    // Optional outbound relay to Dawarich. Disabled (a no-op handle) unless a
+    // Dawarich URL is configured.
+    let forwarder = forwarder::start(&config);
 
     // Per-client rate limiting (keyed per `apply_rate_limit`). A flood is
     // black-holed as a bare 404 at the outermost layer, before auth even runs.
-    let base = build_app(config.clone()).layer(ConcurrencyLimitLayer::new(config.max_concurrency));
+    let base = build_app(config.clone(), forwarder)
+        .layer(ConcurrencyLimitLayer::new(config.max_concurrency));
     let app = apply_rate_limit(base, &config);
 
     let listener = TcpListener::bind(config.bind_addr).await?;

@@ -1,9 +1,14 @@
 # locationrelay
 
 A deliberately tiny, hardened HTTP receiver for [Overland iOS](https://github.com/aaronpk/Overland-iOS)
-location beacons. It does **exactly one thing**: authenticate a `POST`, validate
-the GeoJSON batch, and append it to disk as NDJSON. No database, no dynamic
-routes, no admin surface, no read-back API.
+location beacons. It authenticates a `POST`, validates the GeoJSON batch, and
+appends it to disk as NDJSON. No database, no dynamic routes, no admin surface,
+no read-back API.
+
+Optionally, it can also **relay** each batch onward to a
+[Dawarich](https://dawarich.app) instance (see
+[Relay to Dawarich](#relay-to-dawarich-optional)). Forwarding is off by default;
+with it disabled the service behaves exactly as a pure disk sink.
 
 ## Why it's shaped this way
 
@@ -67,6 +72,46 @@ accepts `?access_token=<token>` for templated-URL setups.
 > default, and it persists in client-side URL history. If you must use the query
 > form, configure the proxy to strip/scrub the query string from its logs and
 > treat any leaked URL as a token compromise (rotate it).
+
+## Relay to Dawarich (optional)
+
+Set `LOCATIONRELAY_DAWARICH_URL` **and** `LOCATIONRELAY_DAWARICH_TOKEN` to also
+forward every received batch to a [Dawarich](https://dawarich.app) instance via
+its Overland endpoint (`{url}/api/v1/overland/batches`). Leave them unset and the
+service stays a pure disk sink — nothing changes.
+
+```
+Overland -> locationrelay -> append NDJSON (durable)  ──┐
+                                                        └─> queue ─> worker ─> Dawarich
+```
+
+Design notes:
+
+- **Decoupled.** Persisting to local NDJSON happens first and is the durable
+  source of truth. The batch is then handed to a bounded in-memory queue drained
+  by a background worker, so a slow or unavailable Dawarich **never blocks the
+  inbound request** from Overland, and the iPhone is never made to retry (which
+  would double-write the local file).
+- **At-most-once.** The worker retries transient failures (network, timeout,
+  `5xx`, `429`) with exponential backoff up to `LOCATIONRELAY_FORWARD_MAX_ATTEMPTS`
+  total tries, then drops that batch (it remains on disk). Hard rejections (`4xx`,
+  e.g. a bad key) are not retried. If the process restarts or the queue overflows
+  during a Dawarich outage, those batches are not auto-forwarded — they stay on
+  disk for manual replay.
+- **Bearer, never a query parameter.** The Dawarich key is sent as
+  `Authorization: Bearer <key>`. Dawarich's docs show `?api_key=`, but its API
+  also accepts the Bearer header — using it keeps the key out of Dawarich's
+  URL/access logs. The key is never logged here either.
+- **Separate credential.** `LOCATIONRELAY_DAWARICH_TOKEN` must differ from the
+  inbound `LOCATIONRELAY_TOKEN`; the service refuses to start if they match.
+- Failed/dropped forwards are aggregated like rejections — at most one summary
+  line per minute (`N batches not forwarded to Dawarich in the last 60s`).
+
+> Is a queue overkill since Dawarich has Sidekiq? Sidekiq only absorbs Dawarich's
+> *internal* work after it has accepted a request; it does nothing for the
+> network hop between this service and Dawarich (latency, redeploys, outages).
+> The queue here is what keeps those conditions off the inbound path — it stays
+> lightweight precisely because the disk write already guarantees durability.
 
 ## Run locally
 
@@ -146,7 +191,7 @@ normalizes forwarded headers and you specifically need per-device limits.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `LOCATIONRELAY_TOKEN` | **yes** | — | Shared secret (≥16 chars) |
+| `LOCATIONRELAY_TOKEN` | **yes** | — | Shared secret (≥24 chars) |
 | `LOCATIONRELAY_BIND` | no | `127.0.0.1:8080` | Listen address |
 | `LOCATIONRELAY_DATA_DIR` | no | `./data` | NDJSON output directory |
 | `LOCATIONRELAY_MAX_BODY_BYTES` | no | `1048576` | Max request body |
@@ -158,6 +203,11 @@ normalizes forwarded headers and you specifically need per-device limits.
 | `LOCATIONRELAY_RETENTION_DAYS` | no | `14` | Prune day-files older than this (`0` = keep forever) |
 | `LOCATIONRELAY_TRUST_PROXY` | no | `false` | Rate-limit keying (see below) |
 | `LOCATIONRELAY_FSYNC` | no | `true` | fsync each batch before replying |
+| `LOCATIONRELAY_DAWARICH_URL` | no | — | Dawarich base URL (http/https); enables forwarding |
+| `LOCATIONRELAY_DAWARICH_TOKEN` | no | — | Dawarich API key (Bearer); must differ from `LOCATIONRELAY_TOKEN` |
+| `LOCATIONRELAY_FORWARD_TIMEOUT_SECS` | no | `10` | Outbound POST timeout to Dawarich |
+| `LOCATIONRELAY_FORWARD_QUEUE_CAPACITY` | no | `256` | Bounded forward queue size |
+| `LOCATIONRELAY_FORWARD_MAX_ATTEMPTS` | no | `3` | Total tries per batch before dropping |
 | `LOCATIONRELAY_LOG` | no | `locationrelay=info,tower_http=warn` | Tracing filter |
 
 Booleans (`LOCATIONRELAY_FSYNC`, `LOCATIONRELAY_TRUST_PROXY`) accept

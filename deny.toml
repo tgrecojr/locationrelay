@@ -23,6 +23,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # Mozilla CA root-certificate bundle (webpki-root-certs), pulled in by
+    # reqwest's rustls TLS certificate verifier. A permissive *data* license.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

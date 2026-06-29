@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::error::AppError;
+use crate::forwarder::ForwardHandle;
 use crate::models::{self, OverlandPayload};
 use crate::storage;
 
@@ -30,6 +31,7 @@ pub struct Receipt {
 pub async fn receive(
     method: Method,
     State(config): State<Arc<Config>>,
+    State(forwarder): State<ForwardHandle>,
     body: Bytes,
 ) -> Result<Json<Receipt>, AppError> {
     if method != Method::POST {
@@ -41,12 +43,21 @@ pub async fn receive(
         AppError::BadRequest
     })?;
 
-    let features = models::validate(payload)?;
+    let features = Arc::new(models::validate(payload)?);
 
-    storage::append(&config, &features).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to persist location batch");
-        AppError::Internal
-    })?;
+    storage::append(&config, features.as_slice())
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to persist location batch");
+            AppError::Internal
+        })?;
+
+    // Only after the batch is durably on disk do we hand it to the decoupled
+    // forwarder (a no-op when forwarding is disabled). This never blocks and a
+    // forward failure never changes the response we return to Overland.
+    if !features.is_empty() {
+        forwarder.enqueue(features);
+    }
 
     Ok(Json(Receipt { result: "ok" }))
 }
