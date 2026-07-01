@@ -287,9 +287,15 @@ async fn retention_prunes_old_day_files() {
     let removed = storage::prune_old_files(&config).await.unwrap();
     assert_eq!(removed, 2, "both stale day-files (overland + owntracks) go");
     assert!(!old.exists(), "stale Overland day-file should be gone");
-    assert!(!old_owntracks.exists(), "stale OwnTracks day-file should be gone");
+    assert!(
+        !old_owntracks.exists(),
+        "stale OwnTracks day-file should be gone"
+    );
     assert!(today.exists(), "today's Overland file must be kept");
-    assert!(today_owntracks.exists(), "today's OwnTracks file must be kept");
+    assert!(
+        today_owntracks.exists(),
+        "today's OwnTracks file must be kept"
+    );
     assert!(unrelated.exists(), "non day-files must never be touched");
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
