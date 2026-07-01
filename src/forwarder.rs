@@ -10,7 +10,8 @@
 //! manual replay rather than being retried forever.
 //!
 //! The Dawarich API key is sent as an `Authorization: Bearer` header, never as
-//! a query parameter, and is never logged.
+//! a query parameter, and is never logged. The same key authenticates both the
+//! Overland and OwnTracks endpoints.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,14 +23,24 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use crate::config::{Config, DawarichConfig};
 use crate::observability;
 
+/// A single item queued for forwarding, tagged with its source so the worker
+/// can target the right Dawarich endpoint with the right body shape.
+pub enum Forward {
+    /// An Overland batch of GeoJSON features → `/api/v1/overland/batches`,
+    /// wrapped as `{"locations": [...]}`.
+    Overland(Arc<Vec<Value>>),
+    /// A single OwnTracks message → `/api/v1/owntracks/points`, sent as-is.
+    Owntracks(Arc<Value>),
+}
+
 /// Cloneable producer side of the forward queue, injected into the router state.
 ///
 /// When forwarding is disabled (no Dawarich URL configured) this holds `None`
-/// and [`enqueue`](Self::enqueue) is a no-op, so the service behaves exactly as
-/// it did before this feature existed.
+/// and the `enqueue_*` methods are no-ops, so the service behaves exactly as it
+/// did before this feature existed.
 #[derive(Clone)]
 pub struct ForwardHandle {
-    tx: Option<mpsc::Sender<Arc<Vec<Value>>>>,
+    tx: Option<mpsc::Sender<Forward>>,
 }
 
 impl ForwardHandle {
@@ -38,13 +49,23 @@ impl ForwardHandle {
         Self { tx: None }
     }
 
-    /// Queue a batch for forwarding. Never blocks: if the bounded queue is full
-    /// the batch is dropped (it is already durable on disk) and counted.
-    pub fn enqueue(&self, batch: Arc<Vec<Value>>) {
+    /// Queue an Overland batch for forwarding.
+    pub fn enqueue_overland(&self, batch: Arc<Vec<Value>>) {
+        self.enqueue(Forward::Overland(batch));
+    }
+
+    /// Queue a single OwnTracks message for forwarding.
+    pub fn enqueue_owntracks(&self, message: Arc<Value>) {
+        self.enqueue(Forward::Owntracks(message));
+    }
+
+    /// Queue an item for forwarding. Never blocks: if the bounded queue is full
+    /// the item is dropped (it is already durable on disk) and counted.
+    fn enqueue(&self, item: Forward) {
         let Some(tx) = &self.tx else {
             return;
         };
-        match tx.try_send(batch) {
+        match tx.try_send(item) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 observability::record_forward_failure();
@@ -73,7 +94,11 @@ pub fn start(config: &Arc<Config>) -> ForwardHandle {
 
     let (tx, rx) = mpsc::channel(config.forward_queue_capacity.max(1));
     let max_attempts = config.forward_max_attempts.max(1);
-    tracing::info!(endpoint = %dawarich.endpoint, "Dawarich forwarding enabled");
+    tracing::info!(
+        overland = %dawarich.overland_endpoint,
+        owntracks = %dawarich.owntracks_endpoint,
+        "Dawarich forwarding enabled"
+    );
     tokio::spawn(worker(client, dawarich, rx, max_attempts));
     ForwardHandle { tx: Some(tx) }
 }
@@ -88,15 +113,29 @@ fn build_client(config: &Config) -> reqwest::Result<Client> {
         .build()
 }
 
-/// Drain the queue forever, forwarding one batch at a time (order preserved).
+/// Drain the queue forever, forwarding one item at a time (order preserved).
 async fn worker(
     client: Client,
     dawarich: DawarichConfig,
-    mut rx: mpsc::Receiver<Arc<Vec<Value>>>,
+    mut rx: mpsc::Receiver<Forward>,
     max_attempts: u32,
 ) {
-    while let Some(batch) = rx.recv().await {
-        forward_with_retry(&client, &dawarich, &batch, max_attempts).await;
+    while let Some(item) = rx.recv().await {
+        let (endpoint, body) = prepare(&dawarich, &item);
+        forward_with_retry(&client, endpoint, &dawarich.token, &body, max_attempts).await;
+    }
+}
+
+/// Pick the target endpoint and build the request body for one queued item.
+/// Overland batches are wrapped in the `{"locations": [...]}` envelope Dawarich
+/// expects; OwnTracks messages are forwarded verbatim.
+fn prepare<'a>(dawarich: &'a DawarichConfig, item: &Forward) -> (&'a str, Value) {
+    match item {
+        Forward::Overland(batch) => (
+            &dawarich.overland_endpoint,
+            json!({ "locations": &**batch }),
+        ),
+        Forward::Owntracks(message) => (&dawarich.owntracks_endpoint, (**message).clone()),
     }
 }
 
@@ -109,18 +148,18 @@ enum Outcome {
     Permanent(String),
 }
 
-/// Try to forward one batch, retrying transient failures with exponential
-/// backoff up to `max_attempts` total tries, then giving up on this batch only.
+/// Try to forward one item, retrying transient failures with exponential
+/// backoff up to `max_attempts` total tries, then giving up on this item only.
 /// reqwest has no built-in retry, so the loop is explicit.
 async fn forward_with_retry(
     client: &Client,
-    dawarich: &DawarichConfig,
-    batch: &Arc<Vec<Value>>,
+    endpoint: &str,
+    token: &str,
+    body: &Value,
     max_attempts: u32,
 ) {
-    let body = json!({ "locations": &**batch });
     for attempt in 1..=max_attempts {
-        match send_once(client, dawarich, &body).await {
+        match send_once(client, endpoint, token, body).await {
             Outcome::Delivered => return,
             Outcome::Permanent(reason) => {
                 tracing::debug!(reason = %reason, "Dawarich rejected batch; not retrying");
@@ -140,11 +179,8 @@ async fn forward_with_retry(
     }
 }
 
-async fn send_once(client: &Client, dawarich: &DawarichConfig, body: &Value) -> Outcome {
-    let request = client
-        .post(&dawarich.endpoint)
-        .bearer_auth(&dawarich.token)
-        .json(body);
+async fn send_once(client: &Client, endpoint: &str, token: &str, body: &Value) -> Outcome {
+    let request = client.post(endpoint).bearer_auth(token).json(body);
     match request.send().await {
         Ok(resp) => classify_status(resp.status()),
         // A send-time error is always a transport problem (DNS, connect, TLS,

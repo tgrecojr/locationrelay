@@ -1,13 +1,25 @@
 # locationrelay
 
 ## Overview
-A single-purpose, security-hardened HTTP receiver for Overland iOS location
-beacons. It authenticates a `POST`, validates the GeoJSON batch, and appends it
-to disk as NDJSON. It intentionally does nothing else on the inbound surface —
-no DB, no dynamic routes, no read-back/query API, no admin endpoints.
+A single-purpose, security-hardened HTTP receiver for iOS location beacons from
+both **Overland** and **OwnTracks**. It authenticates a `POST`, validates the
+payload, and appends it to disk as NDJSON. It intentionally does nothing else on
+the inbound surface — no DB, no dynamic routes, no read-back/query API, no admin
+endpoints.
 
-Optionally it also **relays** each batch onward to a Dawarich instance (Overland
-endpoint) via a decoupled background worker. Forwarding is off unless
+Two fixed ingest routes, one per source (no path parameters anywhere):
+- `POST /overland` — an Overland GeoJSON batch (`{"locations":[Point features]}`);
+  response `{"result":"ok"}`; stored to `YYYY-MM-DD.ndjson`.
+- `POST /owntracks` — a single OwnTracks message (`{"_type":"location",…}`);
+  response `[]` (the array OwnTracks expects); stored to `YYYY-MM-DD-owntracks.ndjson`.
+
+Both authenticate with the **same** `LOCATIONRELAY_TOKEN` (Bearer or query-token;
+OwnTracks iOS sends it as an `Authorization: Bearer` custom header).
+
+Optionally it also **relays** each payload onward to a Dawarich instance via a
+decoupled background worker: Overland batches → `/api/v1/overland/batches`,
+OwnTracks messages → `/api/v1/owntracks/points`, both with the same reused
+`LOCATIONRELAY_DAWARICH_TOKEN`. Forwarding is off unless
 `LOCATIONRELAY_DAWARICH_URL` + `LOCATIONRELAY_DAWARICH_TOKEN` are both set; when
 off the service is byte-for-byte the original pure disk sink.
 
@@ -28,32 +40,33 @@ off the service is byte-for-byte the original pure disk sink.
 - `cargo deny check` — supply-chain / license audit
 
 ## Architecture
-- `src/lib.rs` — `build_app(config, forwarder)` assembles the core router + middleware (unit-testable) and the `AppState { config, forwarder }` (FromRef-extractable); `apply_rate_limit(base, config)` attaches the governor layer with the black-hole error handler.
+- `src/lib.rs` — `build_app(config, forwarder)` assembles the core router (two ingest routes: `/overland`, `/owntracks`) + middleware (unit-testable) and the `AppState { config, forwarder }` (FromRef-extractable); `apply_rate_limit(base, config)` attaches the governor layer with the black-hole error handler.
 - `src/main.rs` — config load, `forwarder::start`, concurrency layer + `apply_rate_limit`, retention sweep, rejection + forward-failure reporters, hand-off to `server::serve`.
-- `src/forwarder.rs` — optional outbound relay to Dawarich. `ForwardHandle` (cloneable, `disabled()` when off) feeds a bounded in-memory queue; a single background worker POSTs to `{url}/api/v1/overland/batches` with a Bearer header, retry/backoff, no redirects. Decoupled so the inbound handler never blocks.
+- `src/forwarder.rs` — optional outbound relay to Dawarich. `ForwardHandle` (cloneable, `disabled()` when off) exposes `enqueue_overland`/`enqueue_owntracks`, feeding a bounded in-memory queue of `Forward` items; a single background worker POSTs each to its endpoint (`/api/v1/overland/batches` wrapped as `{"locations":…}`, or `/api/v1/owntracks/points` verbatim) with a Bearer header, retry/backoff, no redirects. Decoupled so the inbound handler never blocks.
 - `src/server.rs` — hyper accept loop with an HTTP/1 header-read timeout (slowloris bound), `ConnectInfo` injection, graceful shutdown.
-- `src/config.rs` — env-driven `Config` with validation (token strength, tolerant bool parsing, etc.).
-- `src/auth.rs` — constant-time Bearer/query-token middleware (`route_layer`, pre-body).
-- `src/models.rs` — Overland payload shape + strict GeoJSON validation.
-- `src/storage.rs` — server-side date filename, append-only `0600` NDJSON writes, global write lock (no interleaving), retention pruning.
-- `src/handlers.rs` — `receive` (POST-only; non-POST black-holed) persists then enqueues to the forwarder (after the durable write, never blocking) / `not_found` (no health/status endpoint).
+- `src/config.rs` — env-driven `Config` with validation (token strength, tolerant bool parsing, etc.); `DawarichConfig` derives **both** endpoints from one base URL and one reused key.
+- `src/auth.rs` — constant-time Bearer/query-token middleware (`route_layer`, pre-body). Shared by both ingest routes, one token.
+- `src/models.rs` — Overland payload + strict GeoJSON validation; OwnTracks lenient validation (`validate_owntracks`: any `_type` accepted, but any `lat`/`lon` present must be finite + in range).
+- `src/storage.rs` — `Stream` (Overland | Owntracks) picks the server-side date filename (`YYYY-MM-DD.ndjson` / `YYYY-MM-DD-owntracks.ndjson`); append-only `0600` NDJSON writes, global write lock (no interleaving), retention pruning (matches both filename shapes, prunes on the date part).
+- `src/handlers.rs` — `receive_overland` (→ `{"result":"ok"}`) and `receive_owntracks` (→ `[]`); both POST-only (non-POST black-holed), persist then enqueue to the forwarder (after the durable write, never blocking) / `not_found` (no health/status endpoint).
 - `src/security.rs` — response security headers.
 - `src/error.rs` — non-leaky `AppError` -> HTTP responses.
 - `src/observability.rs` — throttled rejection + forward-failure counters/reporters + time/date helpers.
-- `tests/integration.rs` — auth, validation, storage, headers, method-probe black hole, retention (router built with forwarding disabled).
-- `tests/server.rs` — live serve loop over TCP: happy path, method-probe, slowloris timeout, rate-limit flood black-holed as 404 (not 429).
-- `tests/forwarder.rs` — mock Dawarich: Bearer header (no query/body api_key), correct path/method/body, transient retry, no-retry on 4xx, slow-Dawarich decoupling. Plus `config.rs` unit tests for `build_dawarich` validation.
+- `tests/integration.rs` — auth, Overland + OwnTracks validation/storage, headers, method-probe black hole (both routes), retention for both filename shapes (router built with forwarding disabled).
+- `tests/server.rs` — live serve loop over TCP: happy path (`/overland`), method-probe, slowloris timeout, rate-limit flood black-holed as 404 (not 429).
+- `tests/forwarder.rs` — mock Dawarich: Bearer header (no query/body api_key), correct path/method/body for Overland and OwnTracks (verbatim, no envelope), transient retry, no-retry on 4xx, slow-Dawarich decoupling. Plus `config.rs` unit tests for `build_dawarich` validation.
 
 ## Security invariants (do not regress)
-- Exactly one ingest route; no path/route parameters anywhere (designs out IDOR / traversal).
-- The route is registered for `any` method so a non-POST is black-holed identically to an unknown path — **never reintroduce `post(...)`**, which leaks an `Allow` header and fingerprints the route.
+- Exactly two fixed ingest routes (`/overland`, `/owntracks`); no path/route parameters anywhere (designs out IDOR / traversal). Do not add more inbound surface.
+- Each route is registered for `any` method so a non-POST is black-holed identically to an unknown path — **never reintroduce `post(...)`**, which leaks an `Allow` header and fingerprints the route.
+- Both routes share the one `LOCATIONRELAY_TOKEN` via the same pre-body auth layer; OwnTracks and Overland must never diverge in auth handling.
 - Auth runs **before** the body is read; comparison is constant-time.
-- Storage filename is derived server-side from UTC date — never from client input; retention only ever deletes strict `YYYY-MM-DD.ndjson` files.
+- Storage filename is derived server-side from UTC date (+ a fixed `-owntracks` suffix for the OwnTracks stream) — never from client input; retention only ever deletes strict `YYYY-MM-DD.ndjson` / `YYYY-MM-DD-owntracks.ndjson` files.
 - Error bodies are generic; the token is never logged or echoed (including the query-string form).
 - Rejections are rate-limited in the logs (aggregated, not per-event at info).
 - The rate limiter's rejection must stay a bare `404` (via `apply_rate_limit`'s `error_handler`) — **never let tower_governor emit its default `429 + Retry-After`**, which fingerprints the limiter and leaks its timing, breaking the black-hole property.
 - The HTTP/1 header-read timeout (slowloris bound) must stay set; it requires a hyper `Timer` (`TokioTimer`) to arm.
-- Dawarich relay invariants: the Dawarich key is sent **Bearer-only** (never a query parameter or body field) and is never logged; `LOCATIONRELAY_DAWARICH_TOKEN` must differ from `LOCATIONRELAY_TOKEN` (enforced at startup); forwarding is **decoupled** and must never block or fail the inbound handler (enqueue is non-blocking `try_send` after the durable write); the outbound client follows **no redirects**; forwarding stays **outbound-only** — never add an inbound route or surface for it.
+- Dawarich relay invariants: the Dawarich key is sent **Bearer-only** (never a query parameter or body field) for **both** the Overland and OwnTracks endpoints, and is never logged; the same key serves both (do not add a second Dawarich credential); `LOCATIONRELAY_DAWARICH_TOKEN` must differ from `LOCATIONRELAY_TOKEN` (enforced at startup); OwnTracks messages are forwarded **verbatim** (no `{"locations":…}` envelope) to `/api/v1/owntracks/points`; forwarding is **decoupled** and must never block or fail the inbound handler (enqueue is non-blocking `try_send` after the durable write); the outbound client follows **no redirects**; forwarding stays **outbound-only** — never add an inbound route or surface for it.
 - Any new dependency must pass `cargo deny check` and keep the tree minimal. (reqwest's rustls/aws-lc-rs needs `cmake` + a C toolchain in the Docker builder stage, and the `CDLA-Permissive-2.0` license allowance in `deny.toml` for the Mozilla root bundle.)
 - Keep files < 300 lines and functions < 50 lines.
 

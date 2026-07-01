@@ -1,25 +1,34 @@
 # locationrelay
 
-A deliberately tiny, hardened HTTP receiver for [Overland iOS](https://github.com/aaronpk/Overland-iOS)
-location beacons. It authenticates a `POST`, validates the GeoJSON batch, and
-appends it to disk as NDJSON. No database, no dynamic routes, no admin surface,
-no read-back API.
+A deliberately tiny, hardened HTTP receiver for iOS location beacons from both
+[Overland](https://github.com/aaronpk/Overland-iOS) and
+[OwnTracks](https://owntracks.org). It authenticates a `POST`, validates the
+payload, and appends it to disk as NDJSON. No database, no dynamic routes, no
+admin surface, no read-back API.
 
-Optionally, it can also **relay** each batch onward to a
+Each source has its own fixed ingest route, both guarded by the **same** token:
+
+| Source | Route | Body | Response | Day-file |
+|---|---|---|---|---|
+| Overland | `POST /overland` | `{"locations":[GeoJSON Point features]}` | `{"result":"ok"}` | `YYYY-MM-DD.ndjson` |
+| OwnTracks | `POST /owntracks` | a single `{"_type":"location",…}` message | `[]` | `YYYY-MM-DD-owntracks.ndjson` |
+
+Optionally, it can also **relay** each payload onward to a
 [Dawarich](https://dawarich.app) instance (see
 [Relay to Dawarich](#relay-to-dawarich-optional)). Forwarding is off by default;
 with it disabled the service behaves exactly as a pure disk sink.
 
 ## Why it's shaped this way
 
-The entire externally reachable surface is **one** authenticated route. There is
-no health/status endpoint and no path parameters anywhere, so there is nothing to
-enumerate or tamper with — IDOR and path traversal are designed out rather than
-filtered. Storage filenames are derived server-side from the UTC date; the client
-never names a file or record.
+The entire externally reachable surface is **two** authenticated routes, one per
+source. There is no health/status endpoint and no path parameters anywhere, so
+there is nothing to enumerate or tamper with — IDOR and path traversal are
+designed out rather than filtered. Storage filenames are derived server-side from
+the UTC date; the client never names a file or record.
 
 ```
-POST /          -> auth -> validate -> append NDJSON -> {"result":"ok"}
+POST /overland  -> auth -> validate -> append NDJSON -> {"result":"ok"}
+POST /owntracks -> auth -> validate -> append NDJSON -> []
 everything else -> 404
 ```
 
@@ -39,16 +48,19 @@ Layers run outermost-first, so cheap rejections happen before expensive work:
 2. **Body-size limit** (`413`) — oversized payloads never reach the parser.
 3. **Auth** — constant-time Bearer/query-token check, **before the body is read**.
    Failure returns a black-hole `404` (indistinguishable from an unknown route).
-4. **Validate** — strict GeoJSON `Point` + coordinate-range checks (`422`).
-5. **Append** — lock-serialized `O_APPEND` write to `data/YYYY-MM-DD.ndjson`,
-   mode `0600` (a global write lock prevents concurrent batches interleaving).
+   The same token guards both routes.
+4. **Validate** — Overland: strict GeoJSON `Point` + coordinate-range checks
+   (`422`). OwnTracks: lenient — every `_type` is accepted so nothing is dropped,
+   but any `lat`/`lon` present must be finite and in range (`422` otherwise).
+5. **Append** — lock-serialized `O_APPEND` write to the per-source day-file, mode
+   `0600` (a global write lock prevents concurrent batches interleaving).
 
 Other controls: per-request timeout, an HTTP/1 header-read timeout that drops
 slow-header (slowloris) connections, concurrency cap, panic isolation (a panicked
 request returns `500`, never crashes the worker), locked-down security headers,
-and generic non-leaky error bodies. A non-POST request to `/` is black-holed with
-the same bare `404` as any unknown path (no `Allow` header), so method probing
-can't fingerprint the ingest route either.
+and generic non-leaky error bodies. A non-POST request to either ingest route is
+black-holed with the same bare `404` as any unknown path (no `Allow` header), so
+method probing can't fingerprint the routes either.
 
 Brute-force attempts do **not** flood the logs: each rejection bumps an atomic
 counter and a background task emits at most one summary line per minute
@@ -60,29 +72,48 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the OWASP Top 10 mapping.
 
 In the Overland iOS app:
 
-- **Receiver Endpoint URL**: `https://your-host/` (HTTPS, via your reverse proxy)
+- **Receiver Endpoint URL**: `https://your-host/overland` (HTTPS, via your reverse proxy)
 - **Access Token**: the value of `LOCATIONRELAY_TOKEN`
 
 Overland sends the token as `Authorization: Bearer <token>`; this service also
 accepts `?access_token=<token>` for templated-URL setups.
 
-> ⚠️ **Prefer the Bearer header.** A token in the query string is not logged by
-> this service, but a TLS-terminating reverse proxy (nginx/Caddy/Cloudflare) will
-> record the **full URL — including `?access_token=` — in its access logs** by
-> default, and it persists in client-side URL history. If you must use the query
-> form, configure the proxy to strip/scrub the query string from its logs and
-> treat any leaked URL as a token compromise (rotate it).
+## Configure OwnTracks
+
+In the OwnTracks iOS app, set mode to **HTTP** and:
+
+- **URL**: `https://your-host/owntracks` (HTTPS, via your reverse proxy)
+- **Auth**: add a custom HTTP header `Authorization` with value `Bearer <token>`
+  (where `<token>` is `LOCATIONRELAY_TOKEN` — the *same* secret Overland uses).
+  The `?token=<token>` query form also works if you prefer it in the URL.
+
+OwnTracks POSTs one message at a time and expects a JSON array in reply; this
+service returns `[]` (it never sends friend/command payloads back). Every message
+type is accepted and stored/forwarded, not just `location`.
+
+> ⚠️ **Prefer the Bearer header** (both apps). A token in the query string is not
+> logged by this service, but a TLS-terminating reverse proxy
+> (nginx/Caddy/Cloudflare) will record the **full URL — including `?token=` — in
+> its access logs** by default, and it persists in client-side URL history. If
+> you must use the query form, configure the proxy to strip/scrub the query
+> string from its logs and treat any leaked URL as a token compromise (rotate it).
 
 ## Relay to Dawarich (optional)
 
 Set `LOCATIONRELAY_DAWARICH_URL` **and** `LOCATIONRELAY_DAWARICH_TOKEN` to also
-forward every received batch to a [Dawarich](https://dawarich.app) instance via
-its Overland endpoint (`{url}/api/v1/overland/batches`). Leave them unset and the
-service stays a pure disk sink — nothing changes.
+forward every received payload to a [Dawarich](https://dawarich.app) instance.
+Each source is relayed to its matching Dawarich endpoint, using the **same** key:
+
+- Overland batches → `{url}/api/v1/overland/batches`, wrapped as `{"locations":…}`.
+- OwnTracks messages → `{url}/api/v1/owntracks/points`, forwarded **verbatim**.
+
+Leave the two variables unset and the service stays a pure disk sink — nothing
+changes.
 
 ```
-Overland -> locationrelay -> append NDJSON (durable)  ──┐
-                                                        └─> queue ─> worker ─> Dawarich
+Overland  -> /overland  ─┐                                ┌─> /api/v1/overland/batches
+                         ├─> append NDJSON (durable) ─> queue ─> worker ─┤
+OwnTracks -> /owntracks ─┘                                └─> /api/v1/owntracks/points
 ```
 
 Design notes:
@@ -99,9 +130,11 @@ Design notes:
   during a Dawarich outage, those batches are not auto-forwarded — they stay on
   disk for manual replay.
 - **Bearer, never a query parameter.** The Dawarich key is sent as
-  `Authorization: Bearer <key>`. Dawarich's docs show `?api_key=`, but its API
-  also accepts the Bearer header — using it keeps the key out of Dawarich's
-  URL/access logs. The key is never logged here either.
+  `Authorization: Bearer <key>` to **both** endpoints. Dawarich's docs show
+  `?api_key=`, but its API also accepts the Bearer header — using it keeps the
+  key out of Dawarich's URL/access logs. The key is never logged here either.
+- **One Dawarich key for both.** The same `LOCATIONRELAY_DAWARICH_TOKEN`
+  authenticates the Overland and OwnTracks relays; there is no separate key.
 - **Separate credential.** `LOCATIONRELAY_DAWARICH_TOKEN` must differ from the
   inbound `LOCATIONRELAY_TOKEN`; the service refuses to start if they match.
 - Failed/dropped forwards are aggregated like rejections — at most one summary

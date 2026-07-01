@@ -1,7 +1,9 @@
-//! Tests for the outbound Dawarich relay: that batches are POSTed to the
-//! Overland endpoint with a Bearer header (never an `api_key` query param), that
-//! transient failures are retried and hard rejections are not, and that a slow
-//! Dawarich never blocks the inbound handler (decoupling).
+//! Tests for the outbound Dawarich relay: that Overland batches and OwnTracks
+//! messages are POSTed to their respective endpoints with a Bearer header (never
+//! an `api_key` query param), that OwnTracks messages are forwarded verbatim
+//! (no `locations` envelope), that transient failures are retried and hard
+//! rejections are not, and that a slow Dawarich never blocks the inbound handler
+//! (decoupling).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,6 +75,7 @@ async fn spawn_mock(statuses: Vec<u16>) -> (String, UnboundedReceiver<Captured>,
     });
     let app = Router::new()
         .route("/api/v1/overland/batches", any(capture))
+        .route("/api/v1/owntracks/points", any(capture))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -97,7 +100,8 @@ fn config_for(base_url: &str, max_attempts: u32) -> Arc<Config> {
         fsync: false,
         trust_proxy: false,
         dawarich: Some(DawarichConfig {
-            endpoint: format!("{base_url}/api/v1/overland/batches"),
+            overland_endpoint: format!("{base_url}/api/v1/overland/batches"),
+            owntracks_endpoint: format!("{base_url}/api/v1/owntracks/points"),
             token: DAWARICH_TOKEN.to_string(),
         }),
         forward_timeout_secs: 2,
@@ -125,7 +129,7 @@ async fn recv(rx: &mut UnboundedReceiver<Captured>) -> Captured {
 async fn forwards_with_bearer_header_and_no_query() {
     let (base, mut rx, _calls) = spawn_mock(vec![201]).await;
     let handle = forwarder::start(&config_for(&base, 3));
-    handle.enqueue(sample_batch());
+    handle.enqueue_overland(sample_batch());
 
     let got = recv(&mut rx).await;
     assert_eq!(got.method, Method::POST);
@@ -150,11 +154,45 @@ async fn forwards_with_bearer_header_and_no_query() {
 }
 
 #[tokio::test]
+async fn forwards_owntracks_to_points_endpoint_verbatim() {
+    let (base, mut rx, _calls) = spawn_mock(vec![200]).await;
+    let handle = forwarder::start(&config_for(&base, 3));
+    let message = Arc::new(json!({
+        "_type": "location",
+        "lat": 39.920383,
+        "lon": -75.14,
+        "tst": 1782904123u64,
+        "tid": "5F"
+    }));
+    handle.enqueue_owntracks(message);
+
+    let got = recv(&mut rx).await;
+    assert_eq!(got.method, Method::POST);
+    // OwnTracks goes to the points endpoint, not the Overland batches endpoint.
+    assert_eq!(got.path, "/api/v1/owntracks/points");
+    assert_eq!(
+        got.authorization.as_deref(),
+        Some(format!("Bearer {DAWARICH_TOKEN}").as_str())
+    );
+    assert!(got.query.is_none(), "api key must not appear in the query");
+
+    // The message is forwarded verbatim — a single object, NOT wrapped in a
+    // `{"locations": [...]}` envelope.
+    let body: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(body["_type"], "location");
+    assert_eq!(body["tid"], "5F");
+    assert!(
+        body.get("locations").is_none(),
+        "OwnTracks body must not be wrapped in a locations envelope"
+    );
+}
+
+#[tokio::test]
 async fn retries_transient_failure_then_succeeds() {
     // First attempt 503 (transient), second 201.
     let (base, mut rx, calls) = spawn_mock(vec![503, 201]).await;
     let handle = forwarder::start(&config_for(&base, 3));
-    handle.enqueue(sample_batch());
+    handle.enqueue_overland(sample_batch());
 
     let _first = recv(&mut rx).await;
     let _second = recv(&mut rx).await;
@@ -166,7 +204,7 @@ async fn does_not_retry_on_client_error() {
     // 401 is a hard rejection — a bad key won't fix itself, so do not retry.
     let (base, mut rx, calls) = spawn_mock(vec![401]).await;
     let handle = forwarder::start(&config_for(&base, 3));
-    handle.enqueue(sample_batch());
+    handle.enqueue_overland(sample_batch());
 
     let _first = recv(&mut rx).await;
     // Wait well past the first backoff window; there must be no second attempt.
@@ -182,7 +220,8 @@ async fn slow_dawarich_does_not_block_the_inbound_handler() {
     // Point the worker at a black hole so any forward attempt stalls; the handler
     // must still return promptly because forwarding is decoupled.
     Arc::get_mut(&mut config).unwrap().dawarich = Some(DawarichConfig {
-        endpoint: "http://10.255.255.1:9/api/v1/overland/batches".to_string(),
+        overland_endpoint: "http://10.255.255.1:9/api/v1/overland/batches".to_string(),
+        owntracks_endpoint: "http://10.255.255.1:9/api/v1/owntracks/points".to_string(),
         token: DAWARICH_TOKEN.to_string(),
     });
     locationrelay::storage::ensure_data_dir(&config)
@@ -194,7 +233,7 @@ async fn slow_dawarich_does_not_block_the_inbound_handler() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/")
+        .uri("/overland")
         .header(header::AUTHORIZATION, format!("Bearer {INBOUND_TOKEN}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(

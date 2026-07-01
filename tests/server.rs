@@ -70,7 +70,7 @@ async fn happy_path_post_over_tcp() {
 
     let body = r#"{"locations":[{"type":"Feature","geometry":{"type":"Point","coordinates":[-73.98,40.74]}}]}"#;
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /overland HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -98,7 +98,7 @@ async fn method_probe_over_tcp_has_no_allow_header() {
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /overland HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
     let resp = read_to_string(stream).await;
@@ -109,7 +109,7 @@ async fn method_probe_over_tcp_has_no_allow_header() {
     );
     assert!(
         !resp.to_ascii_lowercase().contains("allow:"),
-        "GET / leaked an Allow header over the wire:\n{resp}"
+        "GET /overland leaked an Allow header over the wire:\n{resp}"
     );
 
     handle.abort();
