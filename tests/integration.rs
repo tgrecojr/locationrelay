@@ -56,9 +56,13 @@ fn valid_body() -> String {
 }
 
 fn post(token: Option<&str>, body: &str) -> Request<Body> {
+    post_to("/overland", token, body)
+}
+
+fn post_to(uri: &str, token: Option<&str>, body: &str) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
-        .uri("/")
+        .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(t) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -192,44 +196,50 @@ async fn auth_failure_is_indistinguishable_from_unknown_route() {
     assert!(bad_body.is_empty());
 }
 
-/// A non-POST request to `/` must be byte-identical to hitting an unknown path —
-/// same status, same headers (crucially no `Allow` header), same empty body.
-/// Otherwise a method probe could fingerprint the ingest route. Regression guard
-/// for the axum default-405 `Allow: POST` leak.
+/// A non-POST request to an ingest route must be byte-identical to hitting an
+/// unknown path — same status, same headers (crucially no `Allow` header), same
+/// empty body. Otherwise a method probe could fingerprint the ingest route.
+/// Regression guard for the axum default-405 `Allow: POST` leak.
 #[tokio::test]
-async fn method_probe_on_root_is_indistinguishable_from_unknown_route() {
-    for method in ["GET", "OPTIONS", "HEAD", "PUT", "DELETE"] {
-        let on_root = app(test_config(&unique_dir("methodprobe")))
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let on_unknown = app(test_config(&unique_dir("methodprobe")))
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri("/nope")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+async fn method_probe_on_ingest_routes_is_indistinguishable_from_unknown_route() {
+    for route in ["/overland", "/owntracks"] {
+        for method in ["GET", "OPTIONS", "HEAD", "PUT", "DELETE"] {
+            let on_route = app(test_config(&unique_dir("methodprobe")))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(route)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let on_unknown = app(test_config(&unique_dir("methodprobe")))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/nope")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(on_root.status(), StatusCode::NOT_FOUND, "{method} / status");
-        assert!(
-            on_root.headers().get(header::ALLOW).is_none(),
-            "{method} / leaked an Allow header"
-        );
-        assert_eq!(
-            on_root.headers(),
-            on_unknown.headers(),
-            "{method} / headers differ from an unknown route"
-        );
+            assert_eq!(
+                on_route.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {route} status"
+            );
+            assert!(
+                on_route.headers().get(header::ALLOW).is_none(),
+                "{method} {route} leaked an Allow header"
+            );
+            assert_eq!(
+                on_route.headers(),
+                on_unknown.headers(),
+                "{method} {route} headers differ from an unknown route"
+            );
+        }
     }
 }
 
@@ -239,7 +249,7 @@ async fn valid_token_non_post_is_black_holed() {
     let config = test_config(&unique_dir("validget"));
     let req = Request::builder()
         .method("GET")
-        .uri("/")
+        .uri("/overland")
         .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
         .body(Body::empty())
         .unwrap();
@@ -258,19 +268,34 @@ async fn retention_prunes_old_day_files() {
     storage::ensure_data_dir(&config).await.unwrap();
 
     let old = dir.join("2000-01-01.ndjson");
+    let old_owntracks = dir.join("2000-01-01-owntracks.ndjson");
     let today = dir.join(format!(
         "{}.ndjson",
         locationrelay::observability::utc_date()
     ));
+    let today_owntracks = dir.join(format!(
+        "{}-owntracks.ndjson",
+        locationrelay::observability::utc_date()
+    ));
     let unrelated = dir.join("notes.txt");
     tokio::fs::write(&old, b"{}\n").await.unwrap();
+    tokio::fs::write(&old_owntracks, b"{}\n").await.unwrap();
     tokio::fs::write(&today, b"{}\n").await.unwrap();
+    tokio::fs::write(&today_owntracks, b"{}\n").await.unwrap();
     tokio::fs::write(&unrelated, b"keep me").await.unwrap();
 
     let removed = storage::prune_old_files(&config).await.unwrap();
-    assert_eq!(removed, 1, "only the stale day-file should be removed");
-    assert!(!old.exists(), "stale day-file should be gone");
-    assert!(today.exists(), "today's file must be kept");
+    assert_eq!(removed, 2, "both stale day-files (overland + owntracks) go");
+    assert!(!old.exists(), "stale Overland day-file should be gone");
+    assert!(
+        !old_owntracks.exists(),
+        "stale OwnTracks day-file should be gone"
+    );
+    assert!(today.exists(), "today's Overland file must be kept");
+    assert!(
+        today_owntracks.exists(),
+        "today's OwnTracks file must be kept"
+    );
     assert!(unrelated.exists(), "non day-files must never be touched");
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -294,7 +319,7 @@ async fn query_token_auth_decodes_special_chars() {
     let encoded: String = form_urlencoded::byte_serialize(token.as_bytes()).collect();
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/?access_token={encoded}"))
+        .uri(format!("/overland?access_token={encoded}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(valid_body()))
         .unwrap();
@@ -349,6 +374,84 @@ async fn unknown_route_is_not_found() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(status_of(config, req).await, StatusCode::NOT_FOUND);
+}
+
+fn owntracks_body() -> String {
+    serde_json::json!({
+        "_type": "location",
+        "lat": 39.9203830,
+        "lon": -75.1400,
+        "tst": 1782904123u64,
+        "tid": "5F",
+        "batt": 100,
+        "topic": "owntracks/user/DEVICE",
+        "conn": "w"
+    })
+    .to_string()
+}
+
+/// A valid OwnTracks location message is persisted to its own day-file and the
+/// 200 response body is the empty JSON array OwnTracks expects.
+#[tokio::test]
+async fn owntracks_message_is_stored_and_returns_empty_array() {
+    let dir = unique_dir("owntracks-valid");
+    let config = test_config(&dir);
+    storage::ensure_data_dir(&config).await.unwrap();
+
+    let response = app(config)
+        .oneshot(post_to("/owntracks", Some(TOKEN), &owntracks_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"[]", "OwnTracks expects an empty JSON array");
+
+    // The record lands in the `-owntracks` day-file, not the Overland one.
+    let expected = dir.join(format!(
+        "{}-owntracks.ndjson",
+        locationrelay::observability::utc_date()
+    ));
+    let contents = tokio::fs::read_to_string(&expected).await.unwrap();
+    assert!(contents.contains("39.920383"));
+    assert!(contents.contains("received_at"));
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// Non-`location` OwnTracks messages (e.g. `lwt`) are accepted and stored rather
+/// than rejected, so the app never triggers an OwnTracks retry loop.
+#[tokio::test]
+async fn owntracks_non_location_message_is_accepted() {
+    let dir = unique_dir("owntracks-lwt");
+    let config = test_config(&dir);
+    storage::ensure_data_dir(&config).await.unwrap();
+
+    let body = serde_json::json!({ "_type": "lwt", "tst": 1782904000u64 }).to_string();
+    let status = status_of(config, post_to("/owntracks", Some(TOKEN), &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// An OwnTracks location with an out-of-range coordinate is still rejected —
+/// the tampering control applies whenever lat/lon are present.
+#[tokio::test]
+async fn owntracks_out_of_range_coordinate_is_rejected() {
+    let config = test_config(&unique_dir("owntracks-badcoord"));
+    let body = serde_json::json!({ "_type": "location", "lat": 999.0, "lon": 0.0 }).to_string();
+    assert_eq!(
+        status_of(config, post_to("/owntracks", Some(TOKEN), &body)).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// The OwnTracks route is black-holed on a bad token exactly like every other
+/// miss — no token, bare 404.
+#[tokio::test]
+async fn owntracks_missing_token_is_black_holed() {
+    let config = test_config(&unique_dir("owntracks-notoken"));
+    assert_eq!(
+        status_of(config, post_to("/owntracks", None, &owntracks_body())).await,
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]

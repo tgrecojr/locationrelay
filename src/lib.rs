@@ -1,6 +1,8 @@
-//! `locationrelay` — a deliberately tiny, hardened receiver for Overland iOS
-//! location beacons. It does exactly one thing: authenticate a POST, validate
-//! the GeoJSON batch, and append it to disk. Nothing else.
+//! `locationrelay` — a deliberately tiny, hardened receiver for iOS location
+//! beacons from both Overland and OwnTracks. It does exactly one thing:
+//! authenticate a POST, validate the payload, and append it to disk. Overland
+//! posts to `/overland` (a GeoJSON batch), OwnTracks to `/owntracks` (a single
+//! message); each can optionally be relayed on to Dawarich. Nothing else.
 
 pub mod auth;
 pub mod config;
@@ -51,24 +53,28 @@ impl FromRef<AppState> for ForwardHandle {
     }
 }
 
-/// Build the core application router: a single authenticated ingest route plus
-/// a catch-all 404, wrapped with auth, body-size limit, request timeout,
-/// security headers, panic isolation, and tracing. There is no health/status
-/// endpoint. Rate limiting and the concurrency cap are applied in `main` (they
-/// need per-connection IP info) so this stays unit-testable.
+/// Build the core application router: two authenticated ingest routes plus a
+/// catch-all 404, wrapped with auth, body-size limit, request timeout, security
+/// headers, panic isolation, and tracing. There is no health/status endpoint
+/// and no path parameters anywhere. Rate limiting and the concurrency cap are
+/// applied in `main` (they need per-connection IP info) so this stays
+/// unit-testable.
 pub fn build_app(config: Arc<Config>, forwarder: ForwardHandle) -> Router {
     let timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let body_limit = config.max_body_bytes;
 
     Router::new()
-        // Register for *any* method, not just POST. axum's default method router
-        // answers a method mismatch with `405 + Allow: POST`, and even routed
-        // through our 404 fallback it still attaches the `Allow` header — which
-        // fingerprints the ingest route to an unauthenticated method probe and
-        // breaks the black-hole property. Handling every method ourselves lets
-        // `receive` reject non-POST with the exact same bare 404 as an unknown
-        // path, while auth still runs (route_layer) before the body is read.
-        .route("/", any(handlers::receive))
+        // Two fixed ingest paths, one per source: Overland posts GeoJSON batches,
+        // OwnTracks posts single messages. Each is registered for *any* method,
+        // not just POST. axum's default method router answers a method mismatch
+        // with `405 + Allow: POST`, and even routed through our 404 fallback it
+        // still attaches the `Allow` header — which fingerprints the ingest route
+        // to an unauthenticated method probe and breaks the black-hole property.
+        // Handling every method ourselves lets each handler reject non-POST with
+        // the exact same bare 404 as an unknown path, while auth still runs
+        // (route_layer) before the body is read.
+        .route("/overland", any(handlers::receive_overland))
+        .route("/owntracks", any(handlers::receive_owntracks))
         // route_layer => auth runs only for the routes defined above, and
         // crucially before the body is read.
         .route_layer(middleware::from_fn_with_state(

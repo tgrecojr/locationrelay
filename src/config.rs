@@ -47,11 +47,13 @@ pub struct Config {
 
 /// Settings for relaying batches onward to a Dawarich instance. The API key is
 /// sent as an `Authorization: Bearer` header (never a query parameter), so it
-/// stays out of Dawarich's URL/access logs.
+/// stays out of Dawarich's URL/access logs. One key serves both endpoints.
 #[derive(Clone)]
 pub struct DawarichConfig {
     /// Fully-built Overland ingest endpoint (`{base}/api/v1/overland/batches`).
-    pub endpoint: String,
+    pub overland_endpoint: String,
+    /// Fully-built OwnTracks ingest endpoint (`{base}/api/v1/owntracks/points`).
+    pub owntracks_endpoint: String,
     /// Dawarich API key. Never logged. Must differ from the inbound token.
     pub token: String,
 }
@@ -169,10 +171,17 @@ fn build_dawarich(
         );
     }
 
-    // Append the fixed Overland path to the configured base, tolerating an
-    // optional trailing slash. The path is fixed server-side, never client input.
-    let endpoint = format!("{}/api/v1/overland/batches", url.trim_end_matches('/'));
-    Ok(Some(DawarichConfig { endpoint, token }))
+    // Append the fixed Dawarich paths to the configured base, tolerating an
+    // optional trailing slash. Both paths are fixed server-side, never client
+    // input; the same key authenticates both.
+    let base = url.trim_end_matches('/');
+    let overland_endpoint = format!("{base}/api/v1/overland/batches");
+    let owntracks_endpoint = format!("{base}/api/v1/owntracks/points");
+    Ok(Some(DawarichConfig {
+        overland_endpoint,
+        owntracks_endpoint,
+        token,
+    }))
 }
 
 fn require(key: &str) -> anyhow::Result<String> {
@@ -238,8 +247,12 @@ mod tests {
         .unwrap()
         .expect("forwarding enabled");
         assert_eq!(
-            cfg.endpoint,
+            cfg.overland_endpoint,
             "https://dawarich.example.com/api/v1/overland/batches"
+        );
+        assert_eq!(
+            cfg.owntracks_endpoint,
+            "https://dawarich.example.com/api/v1/owntracks/points"
         );
         assert_eq!(cfg.token, "dawarich-key");
     }
@@ -254,8 +267,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            cfg.endpoint,
+            cfg.overland_endpoint,
             "http://localhost:3000/api/v1/overland/batches"
+        );
+        assert_eq!(
+            cfg.owntracks_endpoint,
+            "http://localhost:3000/api/v1/owntracks/points"
         );
     }
 

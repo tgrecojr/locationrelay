@@ -20,6 +20,27 @@ use crate::observability;
 /// JSON serialization happens outside it.
 static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Which inbound source a batch came from. Determines the day-file name so the
+/// two schemas never share a file: Overland → `YYYY-MM-DD.ndjson`, OwnTracks →
+/// `YYYY-MM-DD-owntracks.ndjson`.
+#[derive(Clone, Copy)]
+pub enum Stream {
+    Overland,
+    Owntracks,
+}
+
+impl Stream {
+    /// Server-side day-file name for this stream. Derived purely from the UTC
+    /// date; the client never influences it.
+    fn file_name(self) -> String {
+        let date = observability::utc_date();
+        match self {
+            Stream::Overland => format!("{date}.ndjson"),
+            Stream::Owntracks => format!("{date}-owntracks.ndjson"),
+        }
+    }
+}
+
 /// Create the data directory if needed and lock its permissions to 0700.
 pub async fn ensure_data_dir(config: &Config) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
@@ -32,16 +53,20 @@ pub async fn ensure_data_dir(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Append a validated batch of features to today's NDJSON file.
-pub async fn append(config: &Arc<Config>, features: &[Value]) -> std::io::Result<()> {
-    if features.is_empty() {
+/// Append a validated batch of records to today's NDJSON file for `stream`.
+pub async fn append(
+    config: &Arc<Config>,
+    records: &[Value],
+    stream: Stream,
+) -> std::io::Result<()> {
+    if records.is_empty() {
         return Ok(());
     }
 
     let received_at = observability::now_rfc3339();
     let mut buffer = String::new();
-    for feature in features {
-        let mut record = feature.clone();
+    for record in records {
+        let mut record = record.clone();
         if let Value::Object(map) = &mut record {
             map.insert("received_at".to_string(), json!(received_at));
         }
@@ -49,9 +74,7 @@ pub async fn append(config: &Arc<Config>, features: &[Value]) -> std::io::Result
         buffer.push('\n');
     }
 
-    let path = config
-        .data_dir
-        .join(format!("{}.ndjson", observability::utc_date()));
+    let path = config.data_dir.join(stream.file_name());
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -70,9 +93,10 @@ pub async fn append(config: &Arc<Config>, features: &[Value]) -> std::io::Result
 
 /// Delete day-files older than the retention window. Returns the number removed.
 ///
-/// Only files whose name is exactly `YYYY-MM-DD.ndjson` are ever considered, so
-/// an unexpected file in the data dir is never touched. `retention_days == 0`
-/// disables pruning entirely.
+/// Only files whose name is exactly `YYYY-MM-DD.ndjson` or
+/// `YYYY-MM-DD-owntracks.ndjson` are ever considered, so an unexpected file in
+/// the data dir is never touched. `retention_days == 0` disables pruning
+/// entirely.
 pub async fn prune_old_files(config: &Config) -> std::io::Result<usize> {
     if config.retention_days == 0 {
         return Ok(0);
@@ -90,7 +114,16 @@ pub async fn prune_old_files(config: &Config) -> std::io::Result<usize> {
         else {
             continue;
         };
-        if !is_day_stem(stem) || stem >= cutoff.as_str() {
+        // Accept both `YYYY-MM-DD` (Overland) and `YYYY-MM-DD-owntracks`
+        // (OwnTracks); prune on the date part only. Anything else is left alone.
+        let date_part = if stem.len() == 10 {
+            stem
+        } else if let Some(date) = stem.strip_suffix("-owntracks") {
+            date
+        } else {
+            continue;
+        };
+        if !is_day_stem(date_part) || date_part >= cutoff.as_str() {
             continue;
         }
         match tokio::fs::remove_file(&path).await {
