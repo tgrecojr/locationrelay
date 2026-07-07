@@ -3,15 +3,23 @@
 ## Overview
 A single-purpose, security-hardened HTTP receiver for iOS location beacons from
 both **Overland** and **OwnTracks**. It authenticates a `POST`, validates the
-payload, and appends it to disk as NDJSON. It intentionally does nothing else on
-the inbound surface — no DB, no dynamic routes, no read-back/query API, no admin
-endpoints.
+payload, and writes the **raw request body byte-for-byte** to disk as one
+immutable file per POST. It intentionally does nothing else on the inbound
+surface — no DB, no dynamic routes, no read-back/query API, no admin endpoints.
 
-Two fixed ingest routes, one per source (no path parameters anywhere):
+Two fixed ingest routes, one per source (no path parameters anywhere). Each
+accepted POST is stored verbatim (exact body bytes, unmodified) under a
+server-derived path `{stream}/dt=YYYY-MM-DD/{received_unix_ms}_{shortid}.json`:
 - `POST /overland` — an Overland GeoJSON batch (`{"locations":[Point features]}`);
-  response `{"result":"ok"}`; stored to `YYYY-MM-DD.ndjson`.
+  response `{"result":"ok"}`; stored under `overland/dt=…/`. An **empty** batch is
+  accepted but not stored.
 - `POST /owntracks` — a single OwnTracks message (`{"_type":"location",…}`);
-  response `[]` (the array OwnTracks expects); stored to `YYYY-MM-DD-owntracks.ndjson`.
+  response `[]` (the array OwnTracks expects); stored under `owntracks/dt=…/`.
+
+The on-disk files are a durable **staging** layer for a downstream consumer (a
+bronze/medallion promoter): the body is stored byte-exact, and the server-stamped
+receipt time is carried in the filename (`received_unix_ms`), never injected into
+the payload.
 
 Both authenticate with the **same** `LOCATIONRELAY_TOKEN` (Bearer or query-token;
 OwnTracks iOS sends it as an `Authorization: Bearer` custom header).
@@ -47,12 +55,12 @@ off the service is byte-for-byte the original pure disk sink.
 - `src/config.rs` — env-driven `Config` with validation (token strength, tolerant bool parsing, etc.); `DawarichConfig` derives **both** endpoints from one base URL and one reused key.
 - `src/auth.rs` — constant-time Bearer/query-token middleware (`route_layer`, pre-body). Shared by both ingest routes, one token.
 - `src/models.rs` — Overland payload + strict GeoJSON validation; OwnTracks lenient validation (`validate_owntracks`: any `_type` accepted, but any `lat`/`lon` present must be finite + in range).
-- `src/storage.rs` — `Stream` (Overland | Owntracks) picks the server-side date filename (`YYYY-MM-DD.ndjson` / `YYYY-MM-DD-owntracks.ndjson`); append-only `0600` NDJSON writes, global write lock (no interleaving), retention pruning (matches both filename shapes, prunes on the date part).
-- `src/handlers.rs` — `receive_overland` (→ `{"result":"ok"}`) and `receive_owntracks` (→ `[]`); both POST-only (non-POST black-holed), persist then enqueue to the forwarder (after the durable write, never blocking) / `not_found` (no health/status endpoint).
+- `src/storage.rs` — `Stream` (Overland | Owntracks) picks the server-side stream subdir + date partition (`{stream}/dt=YYYY-MM-DD/`); `capture()` writes the raw body verbatim to `{received_unix_ms}_{shortid}.json` via temp-file + atomic rename (`0600` files in `0700` dirs), no lock needed (one unique file per POST); retention prunes whole `dt=YYYY-MM-DD` partitions older than the window (strict-shape match only). Short id via `getrandom`.
+- `src/handlers.rs` — `receive_overland` (→ `{"result":"ok"}`, skips empty batches) and `receive_owntracks` (→ `[]`); both POST-only (non-POST black-holed); validate as the accept/reject gate, then persist the **raw body** and enqueue the **parsed** form to the forwarder (after the durable write, never blocking) / `not_found` (no health/status endpoint).
 - `src/security.rs` — response security headers.
 - `src/error.rs` — non-leaky `AppError` -> HTTP responses.
 - `src/observability.rs` — throttled rejection + forward-failure counters/reporters + time/date helpers.
-- `tests/integration.rs` — auth, Overland + OwnTracks validation/storage, headers, method-probe black hole (both routes), retention for both filename shapes (router built with forwarding disabled).
+- `tests/integration.rs` — auth, Overland + OwnTracks byte-exact raw capture (verbatim body, no mutation, batch not exploded), empty-batch-skipped, filename/permission shape, headers, method-probe black hole (both routes), retention of `dt=` partitions (router built with forwarding disabled).
 - `tests/server.rs` — live serve loop over TCP: happy path (`/overland`), method-probe, slowloris timeout, rate-limit flood black-holed as 404 (not 429).
 - `tests/forwarder.rs` — mock Dawarich: Bearer header (no query/body api_key), correct path/method/body for Overland and OwnTracks (verbatim, no envelope), transient retry, no-retry on 4xx, slow-Dawarich decoupling. Plus `config.rs` unit tests for `build_dawarich` validation.
 
@@ -61,7 +69,7 @@ off the service is byte-for-byte the original pure disk sink.
 - Each route is registered for `any` method so a non-POST is black-holed identically to an unknown path — **never reintroduce `post(...)`**, which leaks an `Allow` header and fingerprints the route.
 - Both routes share the one `LOCATIONRELAY_TOKEN` via the same pre-body auth layer; OwnTracks and Overland must never diverge in auth handling.
 - Auth runs **before** the body is read; comparison is constant-time.
-- Storage filename is derived server-side from UTC date (+ a fixed `-owntracks` suffix for the OwnTracks stream) — never from client input; retention only ever deletes strict `YYYY-MM-DD.ndjson` / `YYYY-MM-DD-owntracks.ndjson` files.
+- Storage path is derived server-side (fixed stream subdir + UTC date + a `{received_unix_ms}_{shortid}.json` filename) — never from client input; the stored payload is the raw request body byte-for-byte (no mutation/injection/reserialization), so no server metadata or secret can leak into it. Retention only ever deletes whole strict `{stream}/dt=YYYY-MM-DD/` partitions. Writes are temp-file + atomic rename (no partial file under the final name).
 - Error bodies are generic; the token is never logged or echoed (including the query-string form).
 - Rejections are rate-limited in the logs (aggregated, not per-event at info).
 - The rate limiter's rejection must stay a bare `404` (via `apply_rate_limit`'s `error_handler`) — **never let tower_governor emit its default `429 + Retry-After`**, which fingerprints the limiter and leaks its timing, breaking the black-hole property.

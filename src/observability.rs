@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 static FORWARD_FAILED: AtomicU64 = AtomicU64::new(0);
@@ -55,16 +54,13 @@ fn spawn_counter_reporter(counter: &'static AtomicU64, message: &'static str) {
     });
 }
 
-/// Current UTC instant as an RFC 3339 string (server-stamped receipt time).
-/// Formatting is effectively infallible, but on the impossible error we log and
-/// fall back to the epoch rather than emit an empty `received_at`.
-pub fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to format received_at timestamp");
-            "1970-01-01T00:00:00Z".to_string()
-        })
+/// Server-stamped receipt time as `(YYYY-MM-DD, unix_millis)`. Both halves come
+/// from a single instant so the date partition and the millisecond filename can
+/// never disagree across a midnight boundary. The client never influences either.
+pub fn receipt_now() -> (String, u64) {
+    let now = OffsetDateTime::now_utc();
+    let millis = (now.unix_timestamp_nanos() / 1_000_000) as u64;
+    (format_date(now.date()), millis)
 }
 
 /// Current UTC date as `YYYY-MM-DD`, used to derive the storage filename

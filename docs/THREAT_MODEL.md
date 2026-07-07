@@ -26,14 +26,14 @@ then hardening the little that remains.
 
 | ID | Risk | Mitigation in this service |
 |----|------|----------------------------|
-| A01 | Broken Access Control / IDOR | Two fixed routes, **zero** path/route parameters. Client cannot reference any object or file. Storage filename derived server-side from UTC date (with a fixed per-source suffix). |
+| A01 | Broken Access Control / IDOR | Two fixed routes, **zero** path/route parameters. Client cannot reference any object or file. Storage path derived server-side (fixed per-source stream subdir + UTC date partition + server-generated `{received_unix_ms}_{shortid}.json` filename). |
 | A02 | Cryptographic Failures | TLS terminated at the proxy (transport encryption mandatory in prod). Token compared in constant time (`subtle`) to avoid timing leaks. Token never logged. The optional Dawarich key is sent **only** as an `Authorization: Bearer` header (never in the URL/query/body) to both endpoints, over a rustls-verified connection (cert validation is **not** disabled); it is never logged. |
-| A03 | Injection | No SQL, no shell, no template engine, no `eval`. Body parsed by `serde_json`; Overland features validated (GeoJSON `Point`, finite in-range coords) and OwnTracks messages validated (any `lat`/`lon` finite + in range) before write. Output is append-only NDJSON. |
+| A03 | Injection | No SQL, no shell, no template engine, no `eval`. Body parsed by `serde_json`; Overland features validated (GeoJSON `Point`, finite in-range coords) and OwnTracks messages validated (any `lat`/`lon` finite + in range) before write. Output is the raw request body written verbatim to an immutable, append-only per-POST file (never reserialized into a query/command). |
 | A04 | Insecure Design | Minimal-by-design: receive-only, no read-back API, no admin surface. Fail-closed (any error => non-2xx so the phone retries; no silent data loss). |
 | A05 | Security Misconfiguration | No CORS, no directory listing, no verbose errors. Locked-down security headers. Non-root distroless container, recommended run is read-only with `--cap-drop=ALL --security-opt=no-new-privileges` (only the data volume + `/tmp` writable). Config validated at startup (refuses weak/short token; boolean env vars are strictly parsed, no silent fallback). |
 | A06 | Vulnerable & Outdated Components | Minimal dependency tree, pinned `Cargo.lock`, `cargo deny check` in CI (vulnerabilities + unmaintained always denied, plus bans, licenses, sources). |
 | A07 | Identification & Auth Failures | Bearer/query token required, constant-time compare, ≥24-char minimum with a minimum-variety check enforced at startup. Auth failures **and any non-POST method on either ingest route** return a `404` byte-identical to an unknown route — same status, empty body, **no `Allow` header** — so neither a token probe nor a method probe can confirm the endpoint exists (black hole). Per-client rate limiting throttles brute force; failures aggregated in logs (no log flooding). |
-| A08 | Software & Data Integrity Failures | Reproducible builds via `--locked`. Distroless runtime. No remote code / plugin loading. Records are append-only and server-stamped (`received_at`); a global write lock serializes appends so concurrent batches cannot interleave or corrupt a day-file. Deeply-nested JSON is bounded by `serde_json`'s built-in 128-level recursion limit (no stack exhaustion). |
+| A08 | Software & Data Integrity Failures | Reproducible builds via `--locked`. Distroless runtime. No remote code / plugin loading. Captures are append-only and immutable — one file per POST, written via temp-file + atomic rename so a half-written or interleaved file never appears under its final name; unique server-generated names mean concurrent requests never contend (no lock needed). The server-stamped receipt time lives in the filename, never mutating the stored bytes. Deeply-nested JSON is bounded by `serde_json`'s built-in 128-level recursion limit (no stack exhaustion). |
 | A09 | Logging & Monitoring Failures | Structured `tracing`. Secrets and full bodies are never logged. Rejections counted and summarized once per minute (signal without flooding). |
 | A10 | Server-Side Request Forgery | The only outbound requests are the optional Dawarich relays, whose **host and protocol come solely from trusted env config** (`LOCATIONRELAY_DAWARICH_URL`, validated `http`/`https` at startup) with fixed compiled-in endpoint paths — never from request input, so a client cannot redirect them. The client follows **no redirects** (`redirect::Policy::none()`), so a malicious 3xx cannot bounce the bearer key to another host. When forwarding is unconfigured the service makes no outbound requests at all. |
 
@@ -55,12 +55,12 @@ then hardening the little that remains.
   travels Bearer-header-only and is never logged. Prefer an `https://` Dawarich
   URL — an `http://` URL is accepted but would send the key and location data in
   cleartext, so only use it over a trusted local network. Delivery is
-  at-most-once: the local NDJSON write is the source of truth, and a batch dropped
+  at-most-once: the local raw capture is the source of truth, and a batch dropped
   on a Dawarich outage (queue overflow or restart) remains on disk for replay
   rather than being lost.
-- **Disk growth**: a background retention sweep prunes day-files older than
-  `LOCATIONRELAY_RETENTION_DAYS` (default 14), bounding growth for the normal
-  single-device workload. A *compromised* token can still write at the
+- **Disk growth**: a background retention sweep prunes whole `{stream}/dt=…/`
+  capture partitions older than `LOCATIONRELAY_RETENTION_DAYS` (default 14),
+  bounding growth for the normal single-device workload. A *compromised* token can still write at the
   rate/size-capped ingest rate within the window, so also size/quota the data
   volume on internet-facing hosts.
 - **Slowloris / slow-header DoS**: the HTTP/1 server enforces a header-read
