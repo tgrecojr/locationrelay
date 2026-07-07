@@ -1,6 +1,7 @@
 //! End-to-end tests against the core router (`build_app`), exercising auth,
 //! validation, storage, and the locked-down surface area.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -74,50 +75,70 @@ async fn status_of(config: Arc<Config>, req: Request<Body>) -> StatusCode {
     app(config).oneshot(req).await.unwrap().status()
 }
 
+/// Collect every captured payload file under `{dir}/{stream}/dt=*/`.
+async fn capture_files(dir: &std::path::Path, stream: &str) -> Vec<PathBuf> {
+    let stream_dir = dir.join(stream);
+    let mut out = Vec::new();
+    let mut days = match tokio::fs::read_dir(&stream_dir).await {
+        Ok(days) => days,
+        Err(_) => return out,
+    };
+    while let Some(day) = days.next_entry().await.unwrap() {
+        let mut files = tokio::fs::read_dir(day.path()).await.unwrap();
+        while let Some(f) = files.next_entry().await.unwrap() {
+            out.push(f.path());
+        }
+    }
+    out
+}
+
 #[tokio::test]
-async fn valid_request_is_stored() {
+async fn valid_request_is_stored_verbatim() {
     let dir = unique_dir("valid");
     let config = test_config(&dir);
     storage::ensure_data_dir(&config).await.unwrap();
+    let body = valid_body();
 
-    let response = app(config)
-        .oneshot(post(Some(TOKEN), &valid_body()))
-        .await
-        .unwrap();
+    let response = app(config).oneshot(post(Some(TOKEN), &body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&bytes[..], br#"{"result":"ok"}"#);
 
-    // A file for today's date must now exist and mention our coordinates.
-    let mut found = false;
-    let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
-    while let Some(e) = entries.next_entry().await.unwrap() {
-        let contents = tokio::fs::read_to_string(e.path()).await.unwrap();
-        if contents.contains("received_at") && contents.contains("40.7484") {
-            found = true;
-        }
-    }
-    assert!(found, "expected the beacon to be persisted to disk");
+    // Exactly one capture file under overland/dt=<today>/, byte-identical to the
+    // request body — no `received_at` injection, no reserialization.
+    let files = capture_files(&dir, "overland").await;
+    assert_eq!(files.len(), 1, "expected exactly one capture file");
+    let stored = tokio::fs::read(&files[0]).await.unwrap();
+    assert_eq!(
+        stored,
+        body.as_bytes(),
+        "stored bytes must equal the POST body"
+    );
+    assert!(
+        !String::from_utf8_lossy(&stored).contains("received_at"),
+        "the payload must not be mutated with server metadata"
+    );
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
-/// Fire many POSTs concurrently and confirm the day-file ends up with exactly
-/// one clean, parseable JSON line per request — i.e. the write lock prevents
-/// concurrent appends from interleaving or corrupting each other.
+/// Fire many POSTs concurrently and confirm each lands as its own intact,
+/// byte-exact file — no lock needed, no interleaving, no lost writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writes_do_not_interleave() {
+async fn concurrent_writes_each_land_as_own_file() {
     const N: usize = 30;
     let dir = unique_dir("concurrent");
     let config = test_config(&dir);
     storage::ensure_data_dir(&config).await.unwrap();
     let app = app(config);
+    let body = valid_body();
 
     let mut handles = Vec::new();
     for _ in 0..N {
         let app = app.clone();
+        let body = body.clone();
         handles.push(tokio::spawn(async move {
-            app.oneshot(post(Some(TOKEN), &valid_body()))
+            app.oneshot(post(Some(TOKEN), &body))
                 .await
                 .unwrap()
                 .status()
@@ -127,21 +148,119 @@ async fn concurrent_writes_do_not_interleave() {
         assert_eq!(handle.await.unwrap(), StatusCode::OK);
     }
 
-    // Exactly one file (today's date), with N lines, each valid JSON.
-    let mut files = Vec::new();
-    let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
-    while let Some(e) = entries.next_entry().await.unwrap() {
-        files.push(e.path());
+    // N distinct files, each byte-identical to the request body and valid JSON.
+    let files = capture_files(&dir, "overland").await;
+    assert_eq!(files.len(), N, "expected one capture file per request");
+    for path in files {
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(stored, body.as_bytes(), "each file must be an intact copy");
+        serde_json::from_slice::<serde_json::Value>(&stored)
+            .expect("each file must be valid, non-interleaved JSON");
     }
-    assert_eq!(files.len(), 1, "expected a single day-file");
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
 
-    let contents = tokio::fs::read_to_string(&files[0]).await.unwrap();
-    let lines: Vec<&str> = contents.lines().collect();
-    assert_eq!(lines.len(), N, "expected one line per request");
-    for line in lines {
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).expect("each line must be valid, non-interleaved JSON");
-        assert!(parsed.get("received_at").is_some());
+/// An empty Overland batch is accepted (200) but carries no data, so nothing is
+/// written to disk.
+#[tokio::test]
+async fn empty_overland_batch_is_accepted_but_not_stored() {
+    let dir = unique_dir("empty-batch");
+    let config = test_config(&dir);
+    storage::ensure_data_dir(&config).await.unwrap();
+
+    let body = serde_json::json!({ "locations": [] }).to_string();
+    let response = app(config).oneshot(post(Some(TOKEN), &body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(
+        capture_files(&dir, "overland").await.is_empty(),
+        "an empty batch must not be persisted"
+    );
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// A multi-point batch is stored as ONE file preserving the whole envelope — it
+/// is never exploded into per-point records.
+#[tokio::test]
+async fn multi_point_batch_is_one_file_with_envelope() {
+    let dir = unique_dir("multipoint");
+    let config = test_config(&dir);
+    storage::ensure_data_dir(&config).await.unwrap();
+
+    let feature = serde_json::json!({
+        "type": "Feature",
+        "geometry": { "type": "Point", "coordinates": [-73.98, 40.74] }
+    });
+    let body =
+        serde_json::json!({ "locations": [feature.clone(), feature.clone(), feature] }).to_string();
+    let response = app(config).oneshot(post(Some(TOKEN), &body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let files = capture_files(&dir, "overland").await;
+    assert_eq!(
+        files.len(),
+        1,
+        "a batch must be one file, not one-per-point"
+    );
+    let stored: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&files[0]).await.unwrap()).unwrap();
+    assert_eq!(
+        stored["locations"].as_array().unwrap().len(),
+        3,
+        "the batch envelope must be preserved whole"
+    );
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// The capture filename is server-derived (`{ms}_{6hex}.json`), mode 0600, and no
+/// temp remnant is left behind.
+#[tokio::test]
+async fn capture_filename_and_permissions() {
+    let dir = unique_dir("filename");
+    let config = test_config(&dir);
+    storage::ensure_data_dir(&config).await.unwrap();
+
+    let response = app(config)
+        .oneshot(post(Some(TOKEN), &valid_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let files = capture_files(&dir, "overland").await;
+    assert_eq!(files.len(), 1);
+    let name = files[0].file_name().unwrap().to_str().unwrap();
+    let (ms, rest) = name.split_once('_').expect("name is {ms}_{id}.json");
+    assert!(
+        ms.chars().all(|c| c.is_ascii_digit()),
+        "ms must be digits: {name}"
+    );
+    let id = rest.strip_suffix(".json").expect("must end in .json");
+    assert_eq!(id.len(), 6, "short id is 6 hex chars: {name}");
+    assert!(
+        id.chars().all(|c| c.is_ascii_hexdigit()),
+        "short id must be hex: {name}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = tokio::fs::metadata(&files[0])
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "capture file must be 0600");
+    }
+
+    // No leftover temp files in the partition directory.
+    let partition = files[0].parent().unwrap();
+    let mut entries = tokio::fs::read_dir(partition).await.unwrap();
+    while let Some(e) = entries.next_entry().await.unwrap() {
+        let n = e.file_name();
+        assert!(
+            !n.to_string_lossy().starts_with(".tmp"),
+            "a temp remnant was left behind: {n:?}"
+        );
     }
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
@@ -258,45 +377,63 @@ async fn valid_token_non_post_is_black_holed() {
     assert!(response.headers().get(header::ALLOW).is_none());
 }
 
-/// Retention prunes day-files older than the window and keeps recent ones.
+/// Retention prunes `dt=` partition directories older than the window (for both
+/// streams) and keeps recent ones; anything not matching the strict shape is left
+/// alone.
 #[tokio::test]
-async fn retention_prunes_old_day_files() {
+async fn retention_prunes_old_partition_dirs() {
     let dir = unique_dir("retention");
     let mut config = (*test_config(&dir)).clone();
     config.retention_days = 14;
     let config = Arc::new(config);
     storage::ensure_data_dir(&config).await.unwrap();
 
-    let old = dir.join("2000-01-01.ndjson");
-    let old_owntracks = dir.join("2000-01-01-owntracks.ndjson");
-    let today = dir.join(format!(
-        "{}.ndjson",
-        locationrelay::observability::utc_date()
-    ));
-    let today_owntracks = dir.join(format!(
-        "{}-owntracks.ndjson",
-        locationrelay::observability::utc_date()
-    ));
+    let today = locationrelay::observability::utc_date();
+    let old_overland = dir.join("overland/dt=2000-01-01");
+    let old_owntracks = dir.join("owntracks/dt=2000-01-01");
+    let today_overland = dir.join(format!("overland/dt={today}"));
+    let today_owntracks = dir.join(format!("owntracks/dt={today}"));
+    // A non-partition directory and a stray file that must never be touched.
+    let not_a_partition = dir.join("overland/scratch");
     let unrelated = dir.join("notes.txt");
-    tokio::fs::write(&old, b"{}\n").await.unwrap();
-    tokio::fs::write(&old_owntracks, b"{}\n").await.unwrap();
-    tokio::fs::write(&today, b"{}\n").await.unwrap();
-    tokio::fs::write(&today_owntracks, b"{}\n").await.unwrap();
+    for d in [
+        &old_overland,
+        &old_owntracks,
+        &today_overland,
+        &today_owntracks,
+        &not_a_partition,
+    ] {
+        tokio::fs::create_dir_all(d).await.unwrap();
+        tokio::fs::write(d.join("x.json"), b"{}").await.unwrap();
+    }
     tokio::fs::write(&unrelated, b"keep me").await.unwrap();
 
     let removed = storage::prune_old_files(&config).await.unwrap();
-    assert_eq!(removed, 2, "both stale day-files (overland + owntracks) go");
-    assert!(!old.exists(), "stale Overland day-file should be gone");
+    assert_eq!(
+        removed, 2,
+        "both stale partitions (overland + owntracks) go"
+    );
+    assert!(
+        !old_overland.exists(),
+        "stale Overland partition should be gone"
+    );
     assert!(
         !old_owntracks.exists(),
-        "stale OwnTracks day-file should be gone"
+        "stale OwnTracks partition should be gone"
     );
-    assert!(today.exists(), "today's Overland file must be kept");
+    assert!(
+        today_overland.exists(),
+        "today's Overland partition must be kept"
+    );
     assert!(
         today_owntracks.exists(),
-        "today's OwnTracks file must be kept"
+        "today's OwnTracks partition must be kept"
     );
-    assert!(unrelated.exists(), "non day-files must never be touched");
+    assert!(
+        not_a_partition.exists(),
+        "non-`dt=` dirs must never be touched"
+    );
+    assert!(unrelated.exists(), "unrelated files must never be touched");
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
@@ -406,14 +543,18 @@ async fn owntracks_message_is_stored_and_returns_empty_array() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&bytes[..], b"[]", "OwnTracks expects an empty JSON array");
 
-    // The record lands in the `-owntracks` day-file, not the Overland one.
-    let expected = dir.join(format!(
-        "{}-owntracks.ndjson",
-        locationrelay::observability::utc_date()
-    ));
-    let contents = tokio::fs::read_to_string(&expected).await.unwrap();
-    assert!(contents.contains("39.920383"));
-    assert!(contents.contains("received_at"));
+    // The record lands under `owntracks/dt=<today>/`, not the Overland tree, and
+    // is stored verbatim (no `received_at` injection).
+    let body = owntracks_body();
+    let files = capture_files(&dir, "owntracks").await;
+    assert_eq!(files.len(), 1, "one OwnTracks capture file");
+    assert!(
+        capture_files(&dir, "overland").await.is_empty(),
+        "must not land in the Overland tree"
+    );
+    let stored = tokio::fs::read(&files[0]).await.unwrap();
+    assert_eq!(stored, body.as_bytes(), "OwnTracks body stored verbatim");
+    assert!(!String::from_utf8_lossy(&stored).contains("received_at"));
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 

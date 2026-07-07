@@ -47,19 +47,23 @@ pub async fn receive_overland(
         AppError::BadRequest
     })?;
 
+    // Validate as the accept/reject gate and to obtain the parsed features for
+    // forwarding; the raw body is what we persist.
     let features = Arc::new(models::validate(payload)?);
 
-    storage::append(&config, features.as_slice(), Stream::Overland)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to persist location batch");
-            AppError::Internal
-        })?;
-
-    // Only after the batch is durably on disk do we hand it to the decoupled
-    // forwarder (a no-op when forwarding is disabled). This never blocks and a
-    // forward failure never changes the response we return to Overland.
+    // An empty batch is a valid accepted POST but carries no location data, so we
+    // neither store nor forward it (nothing to capture, nothing to relay).
     if !features.is_empty() {
+        storage::capture(&config, body.as_ref(), Stream::Overland)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to persist location batch");
+                AppError::Internal
+            })?;
+
+        // Only after the batch is durably on disk do we hand it to the decoupled
+        // forwarder (a no-op when forwarding is disabled). This never blocks and a
+        // forward failure never changes the response we return to Overland.
         forwarder.enqueue_overland(features);
     }
 
@@ -90,7 +94,8 @@ pub async fn receive_owntracks(
 
     let message = models::validate_owntracks(message)?;
 
-    storage::append(&config, std::slice::from_ref(&message), Stream::Owntracks)
+    // OwnTracks posts a single message per request; capture its raw body verbatim.
+    storage::capture(&config, body.as_ref(), Stream::Owntracks)
         .await
         .map_err(|err| {
             tracing::error!(error = %err, "failed to persist OwnTracks message");

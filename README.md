@@ -3,15 +3,24 @@
 A deliberately tiny, hardened HTTP receiver for iOS location beacons from both
 [Overland](https://github.com/aaronpk/Overland-iOS) and
 [OwnTracks](https://owntracks.org). It authenticates a `POST`, validates the
-payload, and appends it to disk as NDJSON. No database, no dynamic routes, no
-admin surface, no read-back API.
+payload, and writes the **raw request body byte-for-byte** to disk — one
+immutable file per POST. No database, no dynamic routes, no admin surface, no
+read-back API.
 
-Each source has its own fixed ingest route, both guarded by the **same** token:
+Each source has its own fixed ingest route, both guarded by the **same** token.
+Each accepted POST is stored verbatim (the exact body bytes, unmodified) under a
+purely server-derived path:
 
-| Source | Route | Body | Response | Day-file |
+| Source | Route | Body | Response | Stored as |
 |---|---|---|---|---|
-| Overland | `POST /overland` | `{"locations":[GeoJSON Point features]}` | `{"result":"ok"}` | `YYYY-MM-DD.ndjson` |
-| OwnTracks | `POST /owntracks` | a single `{"_type":"location",…}` message | `[]` | `YYYY-MM-DD-owntracks.ndjson` |
+| Overland | `POST /overland` | `{"locations":[GeoJSON Point features]}` | `{"result":"ok"}` | `overland/dt=YYYY-MM-DD/{ms}_{id}.json` |
+| OwnTracks | `POST /owntracks` | a single `{"_type":"location",…}` message | `[]` | `owntracks/dt=YYYY-MM-DD/{ms}_{id}.json` |
+
+The `{ms}` is the server receipt time (UTC epoch milliseconds) and `{id}` a
+random short id; the receipt time lives in the **filename**, never inside the
+stored bytes. These files are a durable **staging** layer intended for a
+downstream consumer (e.g. a bronze/medallion promoter); an empty Overland batch
+is accepted but not stored.
 
 Optionally, it can also **relay** each payload onward to a
 [Dawarich](https://dawarich.app) instance (see
@@ -23,12 +32,13 @@ with it disabled the service behaves exactly as a pure disk sink.
 The entire externally reachable surface is **two** authenticated routes, one per
 source. There is no health/status endpoint and no path parameters anywhere, so
 there is nothing to enumerate or tamper with — IDOR and path traversal are
-designed out rather than filtered. Storage filenames are derived server-side from
-the UTC date; the client never names a file or record.
+designed out rather than filtered. Storage paths are derived server-side (fixed
+stream subdir + UTC date + server-generated filename); the client never names a
+file or record.
 
 ```
-POST /overland  -> auth -> validate -> append NDJSON -> {"result":"ok"}
-POST /owntracks -> auth -> validate -> append NDJSON -> []
+POST /overland  -> auth -> validate -> store raw body -> {"result":"ok"}
+POST /owntracks -> auth -> validate -> store raw body -> []
 everything else -> 404
 ```
 
@@ -52,8 +62,10 @@ Layers run outermost-first, so cheap rejections happen before expensive work:
 4. **Validate** — Overland: strict GeoJSON `Point` + coordinate-range checks
    (`422`). OwnTracks: lenient — every `_type` is accepted so nothing is dropped,
    but any `lat`/`lon` present must be finite and in range (`422` otherwise).
-5. **Append** — lock-serialized `O_APPEND` write to the per-source day-file, mode
-   `0600` (a global write lock prevents concurrent batches interleaving).
+5. **Capture** — the raw request body is written verbatim to its own file via a
+   temp-file + atomic rename (mode `0600` inside `0700` dirs). One file per POST,
+   uniquely named, so concurrent requests never contend or interleave — no lock,
+   no reserialization, no mutation of the stored bytes.
 
 Other controls: per-request timeout, an HTTP/1 header-read timeout that drops
 slow-header (slowloris) connections, concurrency cap, panic isolation (a panicked
@@ -111,14 +123,14 @@ Leave the two variables unset and the service stays a pure disk sink — nothing
 changes.
 
 ```
-Overland  -> /overland  ─┐                                ┌─> /api/v1/overland/batches
-                         ├─> append NDJSON (durable) ─> queue ─> worker ─┤
-OwnTracks -> /owntracks ─┘                                └─> /api/v1/owntracks/points
+Overland  -> /overland  ─┐                                  ┌─> /api/v1/overland/batches
+                         ├─> store raw capture (durable) ─> queue ─> worker ─┤
+OwnTracks -> /owntracks ─┘                                  └─> /api/v1/owntracks/points
 ```
 
 Design notes:
 
-- **Decoupled.** Persisting to local NDJSON happens first and is the durable
+- **Decoupled.** Persisting the raw capture happens first and is the durable
   source of truth. The batch is then handed to a bounded in-memory queue drained
   by a background worker, so a slow or unavailable Dawarich **never blocks the
   inbound request** from Overland, and the iPhone is never made to retry (which
@@ -226,16 +238,16 @@ normalizes forwarded headers and you specifically need per-device limits.
 |---|---|---|---|
 | `LOCATIONRELAY_TOKEN` | **yes** | — | Shared secret (≥24 chars) |
 | `LOCATIONRELAY_BIND` | no | `127.0.0.1:8080` | Listen address |
-| `LOCATIONRELAY_DATA_DIR` | no | `./data` | NDJSON output directory |
+| `LOCATIONRELAY_DATA_DIR` | no | `./data` | Raw capture staging directory |
 | `LOCATIONRELAY_MAX_BODY_BYTES` | no | `1048576` | Max request body |
 | `LOCATIONRELAY_REQUEST_TIMEOUT_SECS` | no | `15` | Per-request timeout |
 | `LOCATIONRELAY_HEADER_TIMEOUT_SECS` | no | `10` | Slow-header (slowloris) timeout |
 | `LOCATIONRELAY_MAX_CONCURRENCY` | no | `64` | Max in-flight requests |
 | `LOCATIONRELAY_RATE_PER_SECOND` | no | `5` | Sustained per-client rate |
 | `LOCATIONRELAY_RATE_BURST` | no | `10` | Per-client burst allowance |
-| `LOCATIONRELAY_RETENTION_DAYS` | no | `14` | Prune day-files older than this (`0` = keep forever) |
+| `LOCATIONRELAY_RETENTION_DAYS` | no | `14` | Prune capture partitions older than this (`0` = keep forever) |
 | `LOCATIONRELAY_TRUST_PROXY` | no | `false` | Rate-limit keying (see below) |
-| `LOCATIONRELAY_FSYNC` | no | `true` | fsync each batch before replying |
+| `LOCATIONRELAY_FSYNC` | no | `true` | fsync each capture before replying |
 | `LOCATIONRELAY_DAWARICH_URL` | no | — | Dawarich base URL (http/https); enables forwarding |
 | `LOCATIONRELAY_DAWARICH_TOKEN` | no | — | Dawarich API key (Bearer); must differ from `LOCATIONRELAY_TOKEN` |
 | `LOCATIONRELAY_FORWARD_TIMEOUT_SECS` | no | `10` | Outbound POST timeout to Dawarich |
@@ -250,10 +262,13 @@ startup error rather than a silent default. The shared secret must be at least
 
 ### Data retention
 
-A background sweep runs at startup and every 6 hours, deleting
-`YYYY-MM-DD.ndjson` day-files older than `LOCATIONRELAY_RETENTION_DAYS` (default
-14). Only files matching that exact server-generated name are ever considered, so
-nothing else in the data directory is touched. Set `0` to disable pruning. This
+A background sweep runs at startup and every 6 hours, deleting whole
+`{stream}/dt=YYYY-MM-DD/` capture partitions older than
+`LOCATIONRELAY_RETENTION_DAYS` (default 14). Only directories matching that exact
+server-generated shape are ever considered, so nothing else in the data directory
+is touched. Set `0` to disable pruning. Because this staging layer is a rolling
+buffer feeding a downstream consumer, keep the window comfortably larger than the
+consumer's worst-case downtime so nothing is pruned before it is consumed. This
 bounds disk growth for the realistic single-device workload; for a hard ceiling
 against a *compromised* token, also size/quota the `/data` volume.
 
